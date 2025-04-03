@@ -1,12 +1,8 @@
 package main
 
 import (
-	"errors"
 	"fmt"
-	"log"
 	"os"
-
-	"github.com/joho/godotenv"
 )
 
 type Config struct {
@@ -20,14 +16,6 @@ const (
 )
 
 func LoadConfig() (*Config, error) {
-	if err := godotenv.Load(); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			log.Println(envFileWarning)
-		} else {
-			log.Printf("WARNING: Error loading .env file: %v\n", err)
-		}
-	}
-
 	botToken, err := getRequiredEnv("TELEGRAM_BOT_TOKEN")
 	if err != nil {
 		return nil, fmt.Errorf("configuration error: %w", err)
