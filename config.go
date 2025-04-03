@@ -22,7 +22,8 @@ const (
 
 func LoadConfig() (*Config, error) {
 	// Only load .env if file exists (local development)
-	fmt.Println("All environment variables:", os.Environ())
+	fmt.Println("TELEGRAM_BOT_TOKEN:", os.Getenv("TELEGRAM_BOT_TOKEN"))
+	fmt.Println("GEMINI_API_KEY:", os.Getenv("GEMINI_API_KEY"))
 	if isLocalEnv() {
 		loadEnvFile()
 	}
