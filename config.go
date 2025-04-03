@@ -14,24 +14,19 @@ type Config struct {
 }
 
 const (
-	envFileWarning = "No .env file found - using system environment variables"
-	requiredErrFmt = "missing required environment variable: %s"
+	envFileWarning    = "No .env file found - using system environment variables"
+	envFileLoadedMsg  = "Loaded .env file successfully"
+	requiredErrFmt    = "missing required environment variable: %s"
+	envFileLoadErrFmt = "WARNING: Error loading .env file: %v"
 )
 
 func LoadConfig() (*Config, error) {
-	// Check if the .env file exists for local development
-	if _, err := os.Stat(".env"); err == nil {
-		// .env file exists, so load it
-		if err := godotenv.Load(); err != nil {
-			log.Printf("WARNING: Error loading .env file: %v\n", err)
-		} else {
-			log.Println("Loaded .env file successfully")
-		}
-	} else if os.IsNotExist(err) {
-		log.Println(envFileWarning)
+	// Only load .env if file exists (local development)
+	if isLocalEnv() {
+		loadEnvFile()
 	}
 
-	// Retrieve the required environment variables
+	// Validate required vars exist in environment
 	botToken, err := getRequiredEnv("TELEGRAM_BOT_TOKEN")
 	if err != nil {
 		return nil, fmt.Errorf("configuration error: %w", err)
@@ -48,10 +43,23 @@ func LoadConfig() (*Config, error) {
 	}, nil
 }
 
-func getRequiredEnv(key string) (string, error) {
-	value, exists := os.LookupEnv(key)
-	if !exists || value == "" {
-		return "", fmt.Errorf(requiredErrFmt, key)
+func isLocalEnv() bool {
+	// Check for .env file existence
+	_, err := os.Stat(".env")
+	return !os.IsNotExist(err)
+}
+
+func loadEnvFile() {
+	if err := godotenv.Load(); err != nil {
+		log.Printf(envFileLoadErrFmt, err)
+		return
 	}
-	return value, nil
+	log.Println(envFileLoadedMsg)
+}
+
+func getRequiredEnv(key string) (string, error) {
+	if value := os.Getenv(key); value != "" {
+		return value, nil
+	}
+	return "", fmt.Errorf(requiredErrFmt, key)
 }
