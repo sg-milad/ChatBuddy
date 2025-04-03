@@ -15,7 +15,7 @@ This is a Telegram bot built with Golang that integrates with the Gemini AI API 
 
 - Golang installed (`go version` to check)
 - Telegram Bot API Token ([Create a bot](https://core.telegram.org/bots#botfather))
-- Gemini API Key ([Get it here](https://ai.google.dev))
+- Gemini API Key [get it here](https://aistudio.google.com/apikey)
 
 ### Clone the Repository
 
@@ -26,12 +26,11 @@ cd telegram-ai-bot
 
 ### Configuration
 
-1. Create a `.env` file or update the `config.go` file with:
+1. Create a `.env` file with:
    ```sh
    BOT_TOKEN=your_telegram_bot_token
    GEMINI_API_KEY=your_gemini_api_key
    ```
-2. Ensure your bot has permissions to read and reply to messages.
 
 ### Running the Bot
 
