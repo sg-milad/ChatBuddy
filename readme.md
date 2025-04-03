@@ -59,12 +59,14 @@ The binary will be located in `bin/mybot`.
 
 ## Usage
 
-- **Mention the bot in a group:** `@YourBot what is 2+2?`
-- **Reply to a message with mention:**
-  ```
-  User:@YourBot What is Golang?
+```
+  User: Mention the bot in a group: `@YourBot what is 2+2?`
+  Bot: 4
+
+  User: What is Golang?
+  User:@YourBot(replay on the message)
   Bot: Golang is a programming language developed by Google...
-  ```
+```
 
 ## Contributing
 
