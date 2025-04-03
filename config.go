@@ -2,7 +2,10 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"os"
+
+	"github.com/joho/godotenv"
 )
 
 type Config struct {
@@ -16,6 +19,19 @@ const (
 )
 
 func LoadConfig() (*Config, error) {
+	// Check if the .env file exists for local development
+	if _, err := os.Stat(".env"); err == nil {
+		// .env file exists, so load it
+		if err := godotenv.Load(); err != nil {
+			log.Printf("WARNING: Error loading .env file: %v\n", err)
+		} else {
+			log.Println("Loaded .env file successfully")
+		}
+	} else if os.IsNotExist(err) {
+		log.Println(envFileWarning)
+	}
+
+	// Retrieve the required environment variables
 	botToken, err := getRequiredEnv("TELEGRAM_BOT_TOKEN")
 	if err != nil {
 		return nil, fmt.Errorf("configuration error: %w", err)
