@@ -49,6 +49,7 @@ type BotService struct {
 	api        *tgbotapi.BotAPI
 	gemini     *GeminiService
 	botMention string
+	id         int64
 }
 
 func NewBotService(cfg *Config) *BotService {
@@ -64,6 +65,7 @@ func NewBotService(cfg *Config) *BotService {
 		api:        bot,
 		gemini:     NewGeminiService(cfg.GeminiAPIKey),
 		botMention: "@" + bot.Self.UserName,
+		id:         bot.Self.ID,
 	}
 }
 
@@ -79,10 +81,11 @@ func (bs *BotService) handleUpdate(update tgbotapi.Update) {
 		return
 	}
 
-	switch {
-	case update.Message.IsCommand():
+	if update.Message.IsCommand() {
 		bs.handleCommand(update.Message)
-	case bs.isBotMentioned(update.Message.Text):
+	} else if bs.isBotMentioned(update.Message.Text) {
+		bs.handleQuery(update.Message)
+	} else if update.Message.ReplyToMessage != nil && update.Message.ReplyToMessage.From.ID == bs.id {
 		bs.handleQuery(update.Message)
 	}
 }
