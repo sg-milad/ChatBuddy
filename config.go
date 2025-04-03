@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"log"
 	"os"
 
@@ -12,20 +14,40 @@ type Config struct {
 	GeminiAPIKey string
 }
 
-func LoadConfig() *Config {
+const (
+	envFileWarning = "No .env file found - using system environment variables"
+	requiredErrFmt = "missing required environment variable: %s"
+)
+
+func LoadConfig() (*Config, error) {
 	if err := godotenv.Load(); err != nil {
-		log.Println("No .env file found, using system environment variables")
+		if errors.Is(err, os.ErrNotExist) {
+			log.Println(envFileWarning)
+		} else {
+			log.Printf("WARNING: Error loading .env file: %v\n", err)
+		}
+	}
+
+	botToken, err := getRequiredEnv("TELEGRAM_BOT_TOKEN")
+	if err != nil {
+		return nil, fmt.Errorf("configuration error: %w", err)
+	}
+
+	geminiKey, err := getRequiredEnv("GEMINI_API_KEY")
+	if err != nil {
+		return nil, fmt.Errorf("configuration error: %w", err)
 	}
 
 	return &Config{
-		BotToken:     getEnv("TELEGRAM_BOT_TOKEN", ""),
-		GeminiAPIKey: getEnv("GEMINI_API_KEY", ""),
-	}
+		BotToken:     botToken,
+		GeminiAPIKey: geminiKey,
+	}, nil
 }
 
-func getEnv(key, defaultVal string) string {
-	if val, exists := os.LookupEnv(key); exists {
-		return val
+func getRequiredEnv(key string) (string, error) {
+	value, exists := os.LookupEnv(key)
+	if !exists || value == "" {
+		return "", fmt.Errorf(requiredErrFmt, key)
 	}
-	return defaultVal
+	return value, nil
 }

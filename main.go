@@ -11,129 +11,167 @@ import (
 	"google.golang.org/api/option"
 )
 
-type BotState struct {
-	GeminiClient *genai.Client
-	GeminiModel  *genai.GenerativeModel
+const (
+	botHelpMessage = `How to use me:
+- Mention me like %s with a question or message
+- I'll reply with some AI magic!
+- Example: '%s What's the weather like?'`
+
+	responseErrorMsg = "I can't process that right now, try again later!"
+	unknownCmdMsg    = "I'm not sure how to respond to that."
+)
+
+type GeminiService struct {
+	client *genai.Client
+	model  *genai.GenerativeModel
 }
 
-func main() {
-	cfg := LoadConfig()
-
-	bot, err := tgbotapi.NewBotAPI(cfg.BotToken)
-	if err != nil {
-		log.Panic(err)
-	}
-
-	bot.Debug = true
-	log.Printf("Authorized on account %s", bot.Self.UserName)
-
-	geminiClient, geminiModel := initGemini(cfg.GeminiAPIKey)
-	defer geminiClient.Close()
-
-	state := &BotState{
-		GeminiClient: geminiClient,
-		GeminiModel:  geminiModel,
-	}
-
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-	updates := bot.GetUpdatesChan(u)
-
-	for update := range updates {
-		if update.Message != nil {
-			handleReplay(bot, update, state)
-		}
-	}
-}
-
-func initGemini(apiKey string) (*genai.Client, *genai.GenerativeModel) {
+func NewGeminiService(apiKey string) *GeminiService {
 	ctx := context.Background()
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
-		log.Fatalf("Failed to create Gemini client: %v", err)
-	}
-	model := client.GenerativeModel("gemini-2.0-flash")
-	return client, model
-}
-
-func handleReplay(bot *tgbotapi.BotAPI, update tgbotapi.Update, state *BotState) {
-	msgText := update.Message.Text
-	chatID := update.Message.Chat.ID
-	botMention := "@" + bot.Self.UserName
-
-	if update.Message.IsCommand() {
-		handleCommands(bot, update)
-		return
+		log.Fatalf("failed to initialize Gemini client: %v", err)
 	}
 
-	if !strings.Contains(strings.ToLower(msgText), strings.ToLower(botMention)) {
-		return
-	}
-
-	var question string
-	if update.Message.ReplyToMessage != nil {
-
-		if strings.Contains(strings.ToLower(msgText), strings.ToLower(botMention)) {
-			question += strings.Replace(msgText, botMention, "", -1)
-		}
-
-		question += update.Message.ReplyToMessage.Text
-	} else {
-		question = msgText
-	}
-
-	response := generateGeminiResponse(question, state)
-	reply := tgbotapi.NewMessage(chatID, response)
-	reply.ReplyToMessageID = update.Message.MessageID
-	bot.Send(reply)
-}
-
-func handleCommands(bot *tgbotapi.BotAPI, update tgbotapi.Update) {
-	botMention := "@" + bot.Self.UserName
-	chatID := update.Message.Chat.ID
-	reply := tgbotapi.NewMessage(chatID, "")
-
-	if update.Message.Command() == "start" {
-		reply.Text = "Hello! I’m ChatBuddy, your AI companion. Mention me with " + botMention + " to chat, or use /help for more info!"
-		bot.Send(reply)
-		return
-	}
-
-	if update.Message.Command() == "help" {
-		reply.Text = "How to use me:\n- Mention me like " + botMention + " with a question or message.\n- I’ll reply with some AI magic!\n- Example: '" + botMention + " What’s the weather like?'"
-		bot.Send(reply)
-		return
+	return &GeminiService{
+		client: client,
+		model:  client.GenerativeModel("gemini-2.0-flash"),
 	}
 }
 
-func generateGeminiResponse(message string, state *BotState) string {
-	prompt := fmt.Sprintf(
-		`You are a helpful Telegram bot that answers all types of questions thoroughly. The user asked: "%s"
-	
-		Follow these response guidelines:
-		1. Address all parts of the question
-		2. Start with a direct answer
-		3. Provide context or examples when needed
-		4. Use bullet points for complex explanations
-		5. Keep technical answers precise but include layman terms
-		
-		Response language: Same as the user's message`,
-		message,
-	)
+func (gs *GeminiService) Close() {
+	if err := gs.client.Close(); err != nil {
+		log.Printf("error closing Gemini client: %v", err)
+	}
+}
 
-	ctx := context.Background()
-	response, err := state.GeminiModel.GenerateContent(ctx, genai.Text(prompt))
+type BotService struct {
+	api        *tgbotapi.BotAPI
+	gemini     *GeminiService
+	botMention string
+}
+
+func NewBotService(cfg *Config) *BotService {
+	bot, err := tgbotapi.NewBotAPI(cfg.BotToken)
 	if err != nil {
-		log.Printf("Error generating response: %v", err)
-		return "I can't process that right now, try again later!"
+		log.Panicf("failed to initialize bot API: %v", err)
 	}
 
-	if len(response.Candidates) > 0 && len(response.Candidates[0].Content.Parts) > 0 {
-		text, ok := response.Candidates[0].Content.Parts[0].(genai.Text)
-		if ok {
-			return string(text)
-		}
+	bot.Debug = true
+	log.Printf("authorized as @%s", bot.Self.UserName)
+
+	return &BotService{
+		api:        bot,
+		gemini:     NewGeminiService(cfg.GeminiAPIKey),
+		botMention: "@" + bot.Self.UserName,
+	}
+}
+
+func (bs *BotService) Run() {
+	updates := bs.api.GetUpdatesChan(tgbotapi.NewUpdate(0))
+	for update := range updates {
+		bs.handleUpdate(update)
+	}
+}
+
+func (bs *BotService) handleUpdate(update tgbotapi.Update) {
+	if update.Message == nil {
+		return
 	}
 
-	return "I'm not sure how to respond to that."
+	switch {
+	case update.Message.IsCommand():
+		bs.handleCommand(update.Message)
+	case bs.isBotMentioned(update.Message.Text):
+		bs.handleQuery(update.Message)
+	}
+}
+
+func (bs *BotService) handleCommand(msg *tgbotapi.Message) {
+	response := tgbotapi.NewMessage(msg.Chat.ID, "")
+	defer bs.sendResponse(response)
+
+	switch msg.Command() {
+	case "start":
+		response.Text = fmt.Sprintf("Hello! I'm ChatBuddy, your AI companion. Mention me with %s to chat, or use /help for more info!", bs.botMention)
+	case "help":
+		response.Text = fmt.Sprintf(botHelpMessage, bs.botMention, bs.botMention)
+	default:
+		response.Text = unknownCmdMsg
+	}
+}
+
+func (bs *BotService) handleQuery(msg *tgbotapi.Message) {
+	question := bs.extractQuestion(msg)
+	response := bs.generateResponse(question)
+
+	reply := tgbotapi.NewMessage(msg.Chat.ID, response)
+	reply.ReplyToMessageID = msg.MessageID
+	bs.sendResponse(reply)
+}
+
+func (bs *BotService) isBotMentioned(text string) bool {
+	return strings.Contains(strings.ToLower(text), strings.ToLower(bs.botMention))
+}
+
+func (bs *BotService) extractQuestion(msg *tgbotapi.Message) string {
+	cleanText := strings.ReplaceAll(msg.Text, bs.botMention, "")
+
+	if msg.ReplyToMessage != nil {
+		return fmt.Sprintf("%s\n\n%s", cleanText, msg.ReplyToMessage.Text)
+	}
+	return cleanText
+}
+
+func (bs *BotService) generateResponse(query string) string {
+	prompt := bs.buildPrompt(query)
+	ctx := context.Background()
+
+	resp, err := bs.gemini.model.GenerateContent(ctx, genai.Text(prompt))
+	if err != nil {
+		log.Printf("gemini generation error: %v", err)
+		return responseErrorMsg
+	}
+
+	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
+		return unknownCmdMsg
+	}
+
+	if text, ok := resp.Candidates[0].Content.Parts[0].(genai.Text); ok {
+		return string(text)
+	}
+	return unknownCmdMsg
+}
+
+func (bs *BotService) buildPrompt(query string) string {
+	return fmt.Sprintf(`You are a helpful Telegram bot that answers all types of questions thoroughly. The user asked: "%s"
+
+    Follow these response guidelines:
+    1. Address all parts of the question
+    2. Start with a direct answer
+    3. Provide context or examples when needed
+    4. Use bullet points for complex explanations
+    5. Keep technical answers precise but include layman terms
+
+    Response language: Same as the user's message`, sanitizeInput(query))
+}
+
+func sanitizeInput(input string) string {
+	return strings.ReplaceAll(input, "%", "%%")
+}
+
+func (bs *BotService) sendResponse(response tgbotapi.MessageConfig) {
+	if _, err := bs.api.Send(response); err != nil {
+		log.Printf("failed to send message: %v", err)
+	}
+}
+
+func main() {
+	cfg, err := LoadConfig()
+	if err != nil {
+		log.Fatalf("Fatal configuration error: %v", err)
+	}
+	bot := NewBotService(cfg)
+	defer bot.gemini.Close()
+	bot.Run()
 }
