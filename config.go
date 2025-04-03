@@ -22,6 +22,7 @@ const (
 
 func LoadConfig() (*Config, error) {
 	// Only load .env if file exists (local development)
+	fmt.Println("All environment variables:", os.Environ())
 	if isLocalEnv() {
 		loadEnvFile()
 	}
