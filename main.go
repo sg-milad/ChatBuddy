@@ -92,7 +92,6 @@ func (bs *BotService) handleUpdate(update tgbotapi.Update) {
 
 func (bs *BotService) handleCommand(msg *tgbotapi.Message) {
 	response := tgbotapi.NewMessage(msg.Chat.ID, "")
-	defer bs.sendResponse(response)
 
 	switch msg.Command() {
 	case "start":
@@ -102,6 +101,7 @@ func (bs *BotService) handleCommand(msg *tgbotapi.Message) {
 	default:
 		response.Text = unknownCmdMsg
 	}
+	bs.sendResponse(response)
 }
 
 func (bs *BotService) handleQuery(msg *tgbotapi.Message) {

@@ -22,11 +22,11 @@ const (
 
 func LoadConfig() (*Config, error) {
 	// Only load .env if file exists (local development)
-	fmt.Println("TELEGRAM_BOT_TOKEN:", os.Getenv("TELEGRAM_BOT_TOKEN"))
-	fmt.Println("GEMINI_API_KEY:", os.Getenv("GEMINI_API_KEY"))
 	if isLocalEnv() {
 		loadEnvFile()
 	}
+	fmt.Println("TELEGRAM_BOT_TOKEN:", os.Getenv("TELEGRAM_BOT_TOKEN"))
+	fmt.Println("GEMINI_API_KEY:", os.Getenv("GEMINI_API_KEY"))
 
 	// Validate required vars exist in environment
 	botToken, err := getRequiredEnv("TELEGRAM_BOT_TOKEN")
