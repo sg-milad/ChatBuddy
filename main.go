@@ -16,7 +16,8 @@ const (
 	botHelpMessage = `How to use me:
 - Mention me like %s with a question or message
 - I'll reply with some AI magic!
-- Example: '%s What's the weather like?'`
+- Example: '%s What's the weather like?' 
+the creator❤️ @sg_milad`
 
 	responseErrorMsg = "I can't process that right now, try again later!"
 	unknownCmdMsg    = "I'm not sure how to respond to that."
