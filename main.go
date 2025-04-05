@@ -156,10 +156,9 @@ func (bs *BotService) buildPrompt(query string) string {
     Follow these response guidelines:
     1. Keep all responses brief and concise (2-3 sentences maximum)
     2. DO NOT use markdown formatting (no asterisks for bold/italic)
-    3. For offensive, inappropriate, or sensitive questions, respond with a light-hearted joke or humorous deflection rather than a direct answer
-    4. Be conversational and friendly
-    5. Focus only on the most essential information
-
+    3. Be conversational and friendly
+    4. Focus only on the most essential information
+    5. Learn from the user's instructions and feedback during this conversation and adapt your responses accordingly.
     Response language: Same as the user's message`, sanitizeInput(query))
 }
 func sanitizeInput(input string) string {
