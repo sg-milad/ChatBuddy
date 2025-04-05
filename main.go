@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/google/generative-ai-go/genai"
@@ -109,6 +110,7 @@ func (bs *BotService) handleQuery(msg *tgbotapi.Message) {
 	response := bs.generateResponse(question)
 
 	reply := tgbotapi.NewMessage(msg.Chat.ID, response)
+
 	reply.ReplyToMessageID = msg.MessageID
 	bs.sendResponse(reply)
 }
@@ -128,7 +130,8 @@ func (bs *BotService) extractQuestion(msg *tgbotapi.Message) string {
 
 func (bs *BotService) generateResponse(query string) string {
 	prompt := bs.buildPrompt(query)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second) // 60s timeout
+	defer cancel()
 
 	resp, err := bs.gemini.model.GenerateContent(ctx, genai.Text(prompt))
 	if err != nil {
@@ -147,25 +150,35 @@ func (bs *BotService) generateResponse(query string) string {
 }
 
 func (bs *BotService) buildPrompt(query string) string {
-	return fmt.Sprintf(`You are a helpful Telegram bot that answers all types of questions thoroughly. The user asked: "%s"
+	return fmt.Sprintf(`You are a helpful and witty Telegram bot. The user asked: "%s"
 
     Follow these response guidelines:
-    1. Address all parts of the question
-    2. Start with a direct answer
-    3. Provide context or examples when needed
-    4. Use bullet points for complex explanations
-    5. Keep technical answers precise but include layman terms
+    1. Keep all responses brief and concise (2-3 sentences maximum)
+    2. DO NOT use markdown formatting (no asterisks for bold/italic)
+    3. For offensive, inappropriate, or sensitive questions, respond with a light-hearted joke or humorous deflection rather than a direct answer
+    4. Be conversational and friendly
+    5. Focus only on the most essential information
 
     Response language: Same as the user's message`, sanitizeInput(query))
 }
-
 func sanitizeInput(input string) string {
 	return strings.ReplaceAll(input, "%", "%%")
 }
 
 func (bs *BotService) sendResponse(response tgbotapi.MessageConfig) {
-	if _, err := bs.api.Send(response); err != nil {
-		log.Printf("failed to send message: %v", err)
+	text := response.Text
+	maxLength := 4096
+
+	for i := 0; i < len(text); i += maxLength {
+		end := i + maxLength
+		if end > len(text) {
+			end = len(text)
+		}
+
+		chunk := tgbotapi.NewMessage(response.ChatID, text[i:end])
+		if _, err := bs.api.Send(chunk); err != nil {
+			log.Printf("failed to send message chunk: %v", err)
+		}
 	}
 }
 
