@@ -85,6 +85,7 @@ func NewBotService(cfg *Config) *BotService {
 	// Initialize Telegram bot with retries
 	var bot *tgbotapi.BotAPI
 	var err error
+	bot.Debug = true
 	maxRetries := 5
 	initialBackoff := 1 * time.Second
 	maxBackoff := 30 * time.Second
@@ -116,9 +117,33 @@ func NewBotService(cfg *Config) *BotService {
 		activePolls:    make(map[string]*PollData),
 	}
 
-	// Schedule hourly quiz at minute 0 of every hour
-	bs.cron.AddFunc("@hourly", bs.sendHourlyPoll)
+	// Add a test entry to confirm activation works
+	bs.activeChannels[123456789] = true
+
+	// Schedule hourly quiz - run at minute 0 of every hour
+	entryID, err := bs.cron.AddFunc("0 * * * *", bs.sendHourlyPoll)
+	if err != nil {
+		log.Printf("Error scheduling cron job: %v", err)
+	} else {
+		log.Printf("Successfully scheduled hourly quiz, entry ID: %v", entryID)
+
+		// Add a test schedule - run after 1 minute for verification
+		_, err := bs.cron.AddFunc("@every 1m", func() {
+			log.Printf("TEST SCHEDULER - This should appear every minute")
+		})
+		if err != nil {
+			log.Printf("Error scheduling test job: %v", err)
+		}
+	}
+
+	// Start the scheduler
 	bs.cron.Start()
+
+	// Log the next run times for verification
+	entries := bs.cron.Entries()
+	for _, entry := range entries {
+		log.Printf("Cron job ID %d scheduled, next run: %v", entry.ID, entry.Next)
+	}
 
 	log.Printf("authorized as @%s, scheduler started", bot.Self.UserName)
 	return bs
@@ -267,7 +292,10 @@ func (bs *BotService) generateResponse(query string) string {
 
 // sendHourlyPoll creates and sends polls to activated channels
 func (bs *BotService) sendHourlyPoll() {
+	log.Printf("Hourly poll scheduler triggered. Active channels: %d", len(bs.activeChannels))
+
 	if len(bs.activeChannels) == 0 {
+		log.Printf("No active channels, skipping hourly poll")
 		return
 	}
 
@@ -275,13 +303,15 @@ func (bs *BotService) sendHourlyPoll() {
 	defer cancel()
 
 	prompt := `
-    Follow these response guidelines:
- 1. DO NOT use markdown formatting (no asterisks for bold/italic)
+	 Follow these response guidelines:
+ 1. DO NOT use markdown formatting (no asterisks for bold/italic),
 	Create a multiple-choice English vocabulary question. Return JSON:
 {"question":"...","choices":["opt1","opt2","opt3","opt4"],"answer_index":<0-3>}.`
+
+	log.Printf("Generating quiz question...")
 	resp, err := bs.gemini.model.GenerateContent(ctx, genai.Text(prompt))
 	if err != nil {
-		log.Printf("Quiz gen error: %v", err)
+		log.Printf("Quiz generation error: %v", err)
 		return
 	}
 
@@ -290,32 +320,51 @@ func (bs *BotService) sendHourlyPoll() {
 		Choices     []string `json:"choices"`
 		AnswerIndex int      `json:"answer_index"`
 	}
+
 	raw := string(resp.Candidates[0].Content.Parts[0].(genai.Text))
+	log.Printf("Raw quiz response: %s", raw)
+
 	if err := json.Unmarshal([]byte(raw), &quiz); err != nil {
 		log.Printf("Quiz parse error: %v - raw: %s", err, raw)
 		return
 	}
 
+	// Validate quiz data
+	if quiz.Question == "" || len(quiz.Choices) != 4 || quiz.AnswerIndex < 0 || quiz.AnswerIndex > 3 {
+		log.Printf("Invalid quiz data: %+v", quiz)
+		return
+	}
+
+	log.Printf("Sending quiz: %s", quiz.Question)
+
 	for chatID := range bs.activeChannels {
+		log.Printf("Sending poll to chat ID: %d", chatID)
+
 		pollCfg := tgbotapi.SendPollConfig{
 			BaseChat:              tgbotapi.BaseChat{ChatID: chatID},
 			Question:              quiz.Question,
 			Options:               quiz.Choices,
 			IsAnonymous:           false,
 			AllowsMultipleAnswers: false,
+			Type:                  "quiz", // Make sure it's sent as a quiz
 		}
+
 		sent, err := bs.api.Send(pollCfg)
 		if err != nil {
-			log.Printf("failed to send poll to %d: %v", chatID, err)
+			log.Printf("Failed to send poll to %d: %v", chatID, err)
 			continue
 		}
+
 		if sent.Poll != nil {
+			log.Printf("Poll sent successfully, ID: %s", sent.Poll.ID)
 			bs.activePolls[sent.Poll.ID] = &PollData{
 				ChatID:        chatID,
 				MessageID:     sent.MessageID,
 				CorrectOption: quiz.AnswerIndex,
 				Options:       quiz.Choices,
 			}
+		} else {
+			log.Printf("Warning: Poll sent but no poll ID returned")
 		}
 	}
 }
