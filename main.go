@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"math/rand"
 	"strings"
 	"time"
 
@@ -15,15 +14,6 @@ import (
 	"google.golang.org/api/option"
 )
 
-// Config holds environment configuration
-// (Assumed to be defined in a separate file with LoadConfig)
-// type Config struct {
-// 	BotToken     string
-// 	GeminiAPIKey string
-// }
-
-// PollData tracks each active poll's metadata
-// and the chat context for channel posts
 type PollData struct {
 	ChatID        int64
 	MessageID     int
@@ -51,6 +41,7 @@ const (
 	botHelpMessage = `How to use me:
 - /activate to enable hourly English quizzes in this chat
 - /deactivate to disable them
+- /quiz [word] to create an instant quiz about a specific word
 - Mention me like %s with a question or message
 - I'll reply with some AI magic!
 - Example: '%s What's the weather like?'
@@ -85,27 +76,11 @@ func NewBotService(cfg *Config) *BotService {
 	// Initialize Telegram bot with retries
 	var bot *tgbotapi.BotAPI
 	var err error
-	maxRetries := 5
-	initialBackoff := 1 * time.Second
-	maxBackoff := 30 * time.Second
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		bot, err = tgbotapi.NewBotAPI(cfg.BotToken)
-		if err == nil {
-			break
-		}
-		if attempt < maxRetries-1 {
-			backoff := initialBackoff * time.Duration(1<<attempt)
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
-			jitter := time.Duration(float64(backoff) * (0.8 + 0.4*rand.Float64()))
-			log.Printf("failed to init bot API (attempt %d/%d): %v, retrying in %v",
-				attempt+1, maxRetries, err, jitter)
-			time.Sleep(jitter)
-		}
-	}
+
+	bot, err = tgbotapi.NewBotAPI(cfg.BotToken)
+
 	if err != nil {
-		log.Panicf("failed to init bot API after %d attempts: %v", maxRetries, err)
+		log.Panicf("failed to init bot API :%v", err)
 	}
 
 	bs := &BotService{
@@ -116,25 +91,15 @@ func NewBotService(cfg *Config) *BotService {
 		activePolls:    make(map[string]*PollData),
 	}
 
-	// Add a test entry to confirm activation works
-	bs.activeChannels[123456789] = true
 	bot.Debug = true
 
 	// Schedule hourly quiz - run at minute 0 of every hour
 	entryID, err := bs.cron.AddFunc("0 * * * *", bs.sendHourlyPoll)
 	if err != nil {
 		log.Printf("Error scheduling cron job: %v", err)
-	} else {
-		log.Printf("Successfully scheduled hourly quiz, entry ID: %v", entryID)
-
-		// Add a test schedule - run after 1 minute for verification
-		_, err := bs.cron.AddFunc("@every 1m", func() {
-			log.Printf("TEST SCHEDULER - This should appear every minute")
-		})
-		if err != nil {
-			log.Printf("Error scheduling test job: %v", err)
-		}
 	}
+
+	log.Printf("Successfully scheduled hourly quiz, entry ID: %v", entryID)
 
 	// Start the scheduler
 	bs.cron.Start()
@@ -225,7 +190,6 @@ func (bs *BotService) Run() {
 	}
 }
 
-// handleCommand processes bot commands for both messages and channel posts
 func (bs *BotService) handleCommand(msg *tgbotapi.Message) {
 	switch msg.Command() {
 	case "start":
@@ -233,8 +197,10 @@ func (bs *BotService) handleCommand(msg *tgbotapi.Message) {
 			fmt.Sprintf("Hello! I'm ChatBuddy. Use /activate to turn on hourly quizzes, /deactivate to turn them off, or mention me to chat.")))
 
 	case "help":
-		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID,
-			fmt.Sprintf(botHelpMessage, bs.api.Self.UserName, bs.api.Self.UserName)))
+		helpMsg := fmt.Sprintf(botHelpMessage, bs.api.Self.UserName, bs.api.Self.UserName)
+		// Add information about the quiz command
+		helpMsg += "\n- /quiz [word] to create an instant quiz about a specific word"
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, helpMsg))
 
 	case "activate":
 		bs.activeChannels[msg.Chat.ID] = true
@@ -243,6 +209,9 @@ func (bs *BotService) handleCommand(msg *tgbotapi.Message) {
 	case "deactivate":
 		delete(bs.activeChannels, msg.Chat.ID)
 		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, "❌ Quizzes deactivated in this chat."))
+
+	case "quiz":
+		bs.handleQuizCommand(msg)
 
 	default:
 		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, unknownCmdMsg))
@@ -288,6 +257,99 @@ func (bs *BotService) generateResponse(query string) string {
 		return string(txt)
 	}
 	return unknownCmdMsg
+}
+
+// Add this function to the BotService struct
+
+// handleQuizCommand processes the /quiz command with a word parameter
+func (bs *BotService) handleQuizCommand(msg *tgbotapi.Message) {
+	// Extract the word parameter from the command
+	args := strings.TrimSpace(msg.CommandArguments())
+	if args == "" {
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, "Please provide a word after /quiz command. Example: /quiz vocabulary"))
+		return
+	}
+
+	// Let the user know we're generating a quiz
+	statusMsg := tgbotapi.NewMessage(msg.Chat.ID, "Generating quiz for word: "+args+"...")
+	bs.api.Send(statusMsg)
+
+	// Generate and send the quiz
+	bs.createAndSendQuiz(msg.Chat.ID, args)
+}
+
+// createAndSendQuiz generates a quiz about a specific word and sends it
+func (bs *BotService) createAndSendQuiz(chatID int64, word string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	prompt := fmt.Sprintf(`
+	Create a multiple-choice English quiz about the word "%s". 
+	This could involve its meaning, synonyms, antonyms, usage in a sentence, or related concepts.
+	Follow these response guidelines:
+	1. DO NOT use markdown formatting (no asterisks for bold/italic)
+	2. Return JSON in this exact format:
+	{"question":"...","choices":["opt1","opt2","opt3","opt4"],"answer_index":<0-3>}`, word)
+
+	log.Printf("Generating quiz for word: %s", word)
+	resp, err := bs.gemini.model.GenerateContent(ctx, genai.Text(prompt))
+	if err != nil {
+		log.Printf("Quiz generation error: %v", err)
+		bs.api.Send(tgbotapi.NewMessage(chatID, "Failed to generate quiz. Please try again later."))
+		return
+	}
+
+	var quiz struct {
+		Question    string   `json:"question"`
+		Choices     []string `json:"choices"`
+		AnswerIndex int      `json:"answer_index"`
+	}
+
+	raw := string(resp.Candidates[0].Content.Parts[0].(genai.Text))
+	log.Printf("Raw quiz response: %s", raw)
+
+	if err := json.Unmarshal([]byte(raw), &quiz); err != nil {
+		log.Printf("Quiz parse error: %v - raw: %s", err, raw)
+		bs.api.Send(tgbotapi.NewMessage(chatID, "Failed to parse quiz. Please try again."))
+		return
+	}
+
+	// Validate quiz data
+	if quiz.Question == "" || len(quiz.Choices) != 4 || quiz.AnswerIndex < 0 || quiz.AnswerIndex > 3 {
+		log.Printf("Invalid quiz data: %+v", quiz)
+		bs.api.Send(tgbotapi.NewMessage(chatID, "Generated quiz data was invalid. Please try again."))
+		return
+	}
+
+	log.Printf("Sending quiz: %s", quiz.Question)
+
+	pollCfg := tgbotapi.SendPollConfig{
+		BaseChat:              tgbotapi.BaseChat{ChatID: chatID},
+		Question:              quiz.Question,
+		Options:               quiz.Choices,
+		IsAnonymous:           false,
+		AllowsMultipleAnswers: false,
+		Type:                  "quiz",
+	}
+
+	sent, err := bs.api.Send(pollCfg)
+	if err != nil {
+		log.Printf("Failed to send poll to %d: %v", chatID, err)
+		bs.api.Send(tgbotapi.NewMessage(chatID, "Failed to send quiz. Please try again later."))
+		return
+	}
+
+	if sent.Poll != nil {
+		log.Printf("Poll sent successfully, ID: %s", sent.Poll.ID)
+		bs.activePolls[sent.Poll.ID] = &PollData{
+			ChatID:        chatID,
+			MessageID:     sent.MessageID,
+			CorrectOption: quiz.AnswerIndex,
+			Options:       quiz.Choices,
+		}
+	} else {
+		log.Printf("Warning: Poll sent but no poll ID returned")
+	}
 }
 
 // sendHourlyPoll creates and sends polls to activated channels
