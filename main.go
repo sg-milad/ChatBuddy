@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 
@@ -12,146 +14,303 @@ import (
 	"google.golang.org/api/option"
 )
 
+type PollData struct {
+	ChatID        int64
+	MessageID     int
+	CorrectOption int
+	Options       []string
+}
+
+// GeminiService wraps the Gemini client/model
+type GeminiService struct {
+	client *genai.Client
+	model  *genai.GenerativeModel
+}
+
+// BotService is the main service struct
+type BotService struct {
+	api    *tgbotapi.BotAPI
+	gemini *GeminiService
+	// cron           *cron.Cron
+	activeChannels map[int64]bool       // chatID → enabled/disabled
+	activePolls    map[string]*PollData // pollID → PollData
+}
+
 const (
+	// Usage/help message
 	botHelpMessage = `How to use me:
+- /activate to enable hourly English quizzes in this chat
+- /deactivate to disable them
+- /quiz [word] to create an instant quiz about a specific word
+- /channelquiz [channelID] [word] to send a quiz to a specific channel
+- /broadcastquiz [word] to send a quiz to ALL active channels
 - Mention me like %s with a question or message
 - I'll reply with some AI magic!
-- Example: '%s What's the weather like?' 
+- Example: '%s What's the weather like?'
 the creator❤️ @sg_milad`
 
 	responseErrorMsg = "I can't process that right now, try again later!"
 	unknownCmdMsg    = "I'm not sure how to respond to that."
 )
 
-type GeminiService struct {
-	client *genai.Client
-	model  *genai.GenerativeModel
-}
-
+// NewGeminiService initializes the Gemini client
 func NewGeminiService(apiKey string) *GeminiService {
 	ctx := context.Background()
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
 		log.Fatalf("failed to initialize Gemini client: %v", err)
 	}
-
 	return &GeminiService{
 		client: client,
 		model:  client.GenerativeModel("gemini-2.0-flash"),
 	}
 }
 
+// Close Gemini client
 func (gs *GeminiService) Close() {
 	if err := gs.client.Close(); err != nil {
 		log.Printf("error closing Gemini client: %v", err)
 	}
 }
 
-type BotService struct {
-	api        *tgbotapi.BotAPI
-	gemini     *GeminiService
-	botMention string
-	id         int64
-}
-
+// NewBotService constructs BotService with retry logic
 func NewBotService(cfg *Config) *BotService {
-	bot, err := tgbotapi.NewBotAPI(cfg.BotToken)
+	// Initialize Telegram bot with retries
+	var bot *tgbotapi.BotAPI
+	var err error
+
+	bot, err = tgbotapi.NewBotAPI(cfg.BotToken)
+
 	if err != nil {
-		log.Panicf("failed to initialize bot API: %v", err)
+		log.Panicf("failed to init bot API :%v", err)
+	}
+
+	bs := &BotService{
+		api:    bot,
+		gemini: NewGeminiService(cfg.GeminiAPIKey),
+		// cron:           cron.New(cron.WithLocation(time.UTC)),
+		activeChannels: make(map[int64]bool),
+		activePolls:    make(map[string]*PollData),
 	}
 
 	bot.Debug = true
-	log.Printf("authorized as @%s", bot.Self.UserName)
 
-	return &BotService{
-		api:        bot,
-		gemini:     NewGeminiService(cfg.GeminiAPIKey),
-		botMention: "@" + bot.Self.UserName,
-		id:         bot.Self.ID,
-	}
+	// Schedule hourly quiz - run at minute 0 of every hour
+	// entryID, err := bs.cron.AddFunc("0 * * * *", bs.sendHourlyPoll)
+	// if err != nil {
+	// 	log.Printf("Error scheduling cron job: %v", err)
+	// }
+
+	// log.Printf("Successfully scheduled hourly quiz, entry ID: %v", entryID)
+
+	// // Start the scheduler
+	// bs.cron.Start()
+
+	// // Log the next run times for verification
+	// entries := bs.cron.Entries()
+	// for _, entry := range entries {
+	// 	log.Printf("Cron job ID %d scheduled, next run: %v", entry.ID, entry.Next)
+	// }
+
+	log.Printf("authorized as @%s, scheduler started", bot.Self.UserName)
+	return bs
 }
 
+// Run starts receiving updates with direct handling
 func (bs *BotService) Run() {
-	updates := bs.api.GetUpdatesChan(tgbotapi.NewUpdate(0))
-	for update := range updates {
-		bs.handleUpdate(update)
+	// Configure update parameters
+	updateConfig := tgbotapi.NewUpdate(0)
+	updateConfig.Timeout = 60
+	updateConfig.AllowedUpdates = []string{"message", "channel_post", "poll_answer"}
+
+	// Main loop - don't use GetUpdatesChan
+	for {
+		// Get updates directly
+		updates, err := bs.api.GetUpdates(updateConfig)
+
+		if err != nil {
+			log.Printf("Error getting updates: %v", err)
+
+			// Handle conflict error by explicitly clearing the webhook
+			if strings.Contains(err.Error(), "Conflict") {
+				_, clearErr := bs.api.Request(tgbotapi.DeleteWebhookConfig{
+					DropPendingUpdates: false,
+				})
+
+				if clearErr != nil {
+					log.Printf("Failed to clear webhook: %v", clearErr)
+				}
+			}
+
+			// Simple fixed delay
+			time.Sleep(3 * time.Second)
+			continue
+		}
+
+		// Process updates
+		for _, update := range updates {
+			// Update offset for next polling
+			updateConfig.Offset = update.UpdateID + 1
+
+			// Handle poll answers
+			if pa := update.PollAnswer; pa != nil {
+				if pd, ok := bs.activePolls[pa.PollID]; ok {
+					reveal := fmt.Sprintf(
+						"✅ The correct answer is option %d: %s",
+						pd.CorrectOption+1,
+						pd.Options[pd.CorrectOption],
+					)
+					msg := tgbotapi.NewMessage(pd.ChatID, reveal)
+					msg.ReplyToMessageID = pd.MessageID
+					bs.api.Send(msg)
+					delete(bs.activePolls, pa.PollID)
+				}
+				continue
+			}
+
+			// Handle channel posts
+			if cp := update.ChannelPost; cp != nil {
+				if cp.IsCommand() {
+					bs.handleCommand(cp)
+				}
+				continue
+			}
+
+			// Handle private/group messages
+			if msg := update.Message; msg != nil {
+				if msg.IsCommand() {
+					bs.handleCommand(msg)
+				} else if bs.isBotMentioned(msg.Text) ||
+					(msg.ReplyToMessage != nil && msg.ReplyToMessage.From.ID == bs.api.Self.ID) {
+					bs.handleQuery(msg)
+				}
+			}
+		}
+
+		// Small pause to prevent CPU spinning on rapid polling
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
-func (bs *BotService) handleUpdate(update tgbotapi.Update) {
-	if update.Message == nil {
+// 1. Modify the activate command to properly store channel IDs
+func (bs *BotService) handleCommand(msg *tgbotapi.Message) {
+	switch msg.Command() {
+	case "start":
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID,
+			fmt.Sprintf("Hello! I'm ChatBuddy. Use /activate to turn on hourly quizzes, /deactivate to turn them off, or mention me to chat.")))
+
+	case "help":
+		helpMsg := fmt.Sprintf(botHelpMessage, bs.api.Self.UserName, bs.api.Self.UserName)
+		// Add information about the quiz command
+		helpMsg += "\n- /quiz [word] to create an instant quiz about a specific word"
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, helpMsg))
+
+	case "activate":
+		bs.activeChannels[msg.Chat.ID] = true
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("✅ Quizzes activated in this chat (ID: %d).", msg.Chat.ID)))
+
+	case "deactivate":
+		delete(bs.activeChannels, msg.Chat.ID)
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, "❌ Quizzes deactivated in this chat."))
+
+	case "quiz":
+		bs.handleQuizCommand(msg)
+
+	case "channelquiz":
+		bs.handleChannelQuizCommand(msg)
+
+	case "broadcastquiz":
+		bs.handleBroadcastQuizCommand(msg)
+
+	case "getid":
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("Chat ID: %d", msg.Chat.ID)))
+
+	default:
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, unknownCmdMsg))
+	}
+}
+
+// 2. Modify the broadcast function to correctly identify channels
+func (bs *BotService) handleBroadcastQuizCommand(msg *tgbotapi.Message) {
+	// Extract the word parameter from the command
+	word := strings.TrimSpace(msg.CommandArguments())
+	if word == "" {
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID,
+			"Please provide a word after /broadcastquiz command. Example: /broadcastquiz vocabulary"))
 		return
 	}
 
-	if update.Message.IsCommand() {
-		bs.handleCommand(update.Message)
-	} else if bs.isBotMentioned(update.Message.Text) {
-		bs.handleQuery(update.Message)
-	} else if update.Message.ReplyToMessage != nil && update.Message.ReplyToMessage.From.ID == bs.id {
-		bs.handleQuery(update.Message)
-	}
-}
+	// Let the user know we're starting the broadcast process
+	statusMsg := tgbotapi.NewMessage(msg.Chat.ID,
+		fmt.Sprintf("📢 Broadcasting quiz about '%s' to all active channels...", word))
+	bs.api.Send(statusMsg)
 
-func (bs *BotService) handleCommand(msg *tgbotapi.Message) {
-	response := tgbotapi.NewMessage(msg.Chat.ID, "")
-
-	switch msg.Command() {
-	case "start":
-		response.Text = fmt.Sprintf("Hello! I'm ChatBuddy, your AI companion. Mention me with %s to chat, or use /help for more info!", bs.botMention)
-	case "help":
-		response.Text = fmt.Sprintf(botHelpMessage, bs.botMention, bs.botMention)
-	default:
-		response.Text = unknownCmdMsg
-	}
-	bs.sendResponse(response)
-}
-
-func (bs *BotService) handleQuery(msg *tgbotapi.Message) {
-	question := bs.extractQuestion(msg)
-	response := bs.generateResponse(question)
-
-	reply := tgbotapi.NewMessage(msg.Chat.ID, response)
-
-	reply.ReplyToMessageID = msg.MessageID
-	bs.sendResponse(reply)
-}
-
-func (bs *BotService) isBotMentioned(text string) bool {
-	return strings.Contains(strings.ToLower(text), strings.ToLower(bs.botMention))
-}
-
-func (bs *BotService) extractQuestion(msg *tgbotapi.Message) string {
-	cleanText := strings.ReplaceAll(msg.Text, bs.botMention, "")
-
-	if msg.ReplyToMessage != nil {
-		return fmt.Sprintf("%s\n\n%s", cleanText, msg.ReplyToMessage.Text)
-	}
-	return cleanText
-}
-
-func (bs *BotService) generateResponse(query string) string {
-	prompt := bs.buildPrompt(query)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second) // 60s timeout
-	defer cancel()
-
-	resp, err := bs.gemini.model.GenerateContent(ctx, genai.Text(prompt))
+	// Generate the quiz content once
+	quizData, err := bs.generateQuiz(word)
 	if err != nil {
-		log.Printf("gemini generation error: %v", err)
-		return responseErrorMsg
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID,
+			fmt.Sprintf("Failed to generate quiz: %v", err)))
+		return
 	}
 
-	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
-		return unknownCmdMsg
+	// Count active channels and successful broadcasts
+	channelCount := len(bs.activeChannels)
+	successCount := 0
+	sentToList := []int64{}
+
+	// Skip sending to the current chat if it's a private chat with the bot
+	skipCurrentChat := msg.Chat.Type == "private"
+
+	// Send the quiz to all active channels
+	for chatID := range bs.activeChannels {
+		// Skip the current chat ID if it's a private chat
+		if skipCurrentChat && chatID == msg.Chat.ID {
+			continue
+		}
+
+		success := bs.sendQuizToChatID(chatID, quizData)
+		if success {
+			successCount++
+			sentToList = append(sentToList, chatID)
+		}
 	}
 
-	if text, ok := resp.Candidates[0].Content.Parts[0].(genai.Text); ok {
-		return string(text)
+	// Report results to the user with detailed info
+	resultMsg := fmt.Sprintf("Quiz about '%s' broadcast complete! ✅\n%d/%d channels received the quiz successfully.",
+		word, successCount, channelCount)
+
+	// Add list of chat IDs where the quiz was sent
+	if len(sentToList) > 0 {
+		resultMsg += "\nSent to chat IDs: "
+		for i, id := range sentToList {
+			if i > 0 {
+				resultMsg += ", "
+			}
+			resultMsg += fmt.Sprintf("%d", id)
+		}
 	}
-	return unknownCmdMsg
+
+	bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, resultMsg))
 }
 
-func (bs *BotService) buildPrompt(query string) string {
-	return fmt.Sprintf(`You are a helpful and witty Telegram bot. The user asked: "%s"
+// handleQuery handles bot mentions and replies
+func (bs *BotService) handleQuery(msg *tgbotapi.Message) {
+	clean := strings.ReplaceAll(msg.Text, bs.api.Self.UserName, "")
+	resp := bs.generateResponse(clean)
+	reply := tgbotapi.NewMessage(msg.Chat.ID, resp)
+	reply.ReplyToMessageID = msg.MessageID
+	bs.sendChunks(reply)
+}
+
+// isBotMentioned checks for mention of the bot's username
+func (bs *BotService) isBotMentioned(text string) bool {
+	return strings.Contains(strings.ToLower(text),
+		strings.ToLower(bs.api.Self.UserName))
+}
+
+// generateResponse queries Gemini for AI reply
+func (bs *BotService) generateResponse(query string) string {
+	prompt := fmt.Sprintf(`You are a helpful and witty Telegram bot. The user asked: "%s"
 
     Follow these response guidelines:
     1. Keep all responses brief and concise (2-3 sentences maximum)
@@ -159,33 +318,610 @@ func (bs *BotService) buildPrompt(query string) string {
     3. Be conversational and friendly
     4. Focus only on the most essential information
     5. Learn from the user's instructions and feedback during this conversation and adapt your responses accordingly.
-    Response language: Same as the user's message`, sanitizeInput(query))
-}
-func sanitizeInput(input string) string {
-	return strings.ReplaceAll(input, "%", "%%")
+    Response language: Same as the user's message`, query)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	resp, err := bs.gemini.model.GenerateContent(ctx, genai.Text(prompt))
+	if err != nil || len(resp.Candidates) == 0 {
+		log.Printf("Gemini error: %v", err)
+		return responseErrorMsg
+	}
+	if txt, ok := resp.Candidates[0].Content.Parts[0].(genai.Text); ok {
+		return string(txt)
+	}
+	return unknownCmdMsg
 }
 
-func (bs *BotService) sendResponse(response tgbotapi.MessageConfig) {
-	text := response.Text
-	maxLength := 4096
+func (bs *BotService) handleQuizCommand(msg *tgbotapi.Message) {
+	// Extract the word parameter from the command
+	args := strings.TrimSpace(msg.CommandArguments())
+	if args == "" {
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, "Please provide a word after /quiz command. Example: /quiz vocabulary"))
+		return
+	}
 
-	for i := 0; i < len(text); i += maxLength {
-		end := i + maxLength
+	// Let the user know we're generating a quiz
+	statusMsg := tgbotapi.NewMessage(msg.Chat.ID, "Generating quiz for word: "+args+"...")
+	bs.api.Send(statusMsg)
+
+	// Generate and send the quiz
+	bs.createAndSendQuiz(msg.Chat.ID, args)
+}
+
+func (bs *BotService) createAndSendQuiz(chatID int64, word string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Modified prompt to strongly emphasize no markdown and clean JSON
+	prompt := fmt.Sprintf(`
+	Create a multiple-choice English quiz about the word "%s". 
+	This could involve its meaning, synonyms, antonyms, usage in a sentence, or related concepts.
+
+	VERY IMPORTANT: Return ONLY raw JSON with NO markdown formatting, NO code blocks, NO backticks.
+	Just the plain JSON object in this exact format:
+	{"question":"...","choices":["opt1","opt2","opt3","opt4"],"answer_index":<0-3>}
+	
+	The response must start with { and end with } with no other text before or after.`, word)
+
+	log.Printf("Generating quiz for word: %s", word)
+	resp, err := bs.gemini.model.GenerateContent(ctx, genai.Text(prompt))
+	if err != nil {
+		log.Printf("Quiz generation error: %v", err)
+		bs.api.Send(tgbotapi.NewMessage(chatID, "Failed to generate quiz. Please try again later."))
+		return
+	}
+
+	var quiz struct {
+		Question    string   `json:"question"`
+		Choices     []string `json:"choices"`
+		AnswerIndex int      `json:"answer_index"`
+	}
+
+	// Extract raw response and clean it up
+	raw := string(resp.Candidates[0].Content.Parts[0].(genai.Text))
+	log.Printf("Raw quiz response: %s", raw)
+
+	// Clean the raw response by extracting just the JSON part
+	cleanedJSON := bs.extractJSON(raw)
+	log.Printf("Cleaned JSON: %s", cleanedJSON)
+
+	if err := json.Unmarshal([]byte(cleanedJSON), &quiz); err != nil {
+		log.Printf("Quiz parse error: %v - raw: %s", err, raw)
+		bs.api.Send(tgbotapi.NewMessage(chatID, "Failed to parse quiz. Please try again."))
+		return
+	}
+
+	// Validate quiz data with detailed error logging
+	if quiz.Question == "" {
+		log.Printf("Quiz error: Empty question field")
+		bs.api.Send(tgbotapi.NewMessage(chatID, "Quiz generation failed: Missing question. Please try again."))
+		return
+	}
+
+	if len(quiz.Choices) != 4 {
+		log.Printf("Quiz error: Expected 4 choices, got %d", len(quiz.Choices))
+		bs.api.Send(tgbotapi.NewMessage(chatID, "Quiz generation failed: Wrong number of options. Please try again."))
+		return
+	}
+
+	if quiz.AnswerIndex < 0 || quiz.AnswerIndex > 3 {
+		log.Printf("Quiz error: Answer index %d out of range", quiz.AnswerIndex)
+		bs.api.Send(tgbotapi.NewMessage(chatID, "Quiz generation failed: Invalid answer index. Please try again."))
+		return
+	}
+
+	log.Printf("Sending quiz: %s", quiz.Question)
+
+	pollCfg := tgbotapi.SendPollConfig{
+		BaseChat:              tgbotapi.BaseChat{ChatID: chatID},
+		Question:              quiz.Question,
+		Options:               quiz.Choices,
+		IsAnonymous:           false,
+		AllowsMultipleAnswers: false,
+		Type:                  "quiz",
+	}
+
+	sent, err := bs.api.Send(pollCfg)
+	if err != nil {
+		log.Printf("Failed to send poll to %d: %v", chatID, err)
+		bs.api.Send(tgbotapi.NewMessage(chatID, "Failed to send quiz. Please try again later."))
+		return
+	}
+
+	if sent.Poll != nil {
+		log.Printf("Poll sent successfully, ID: %s", sent.Poll.ID)
+		bs.activePolls[sent.Poll.ID] = &PollData{
+			ChatID:        chatID,
+			MessageID:     sent.MessageID,
+			CorrectOption: quiz.AnswerIndex,
+			Options:       quiz.Choices,
+		}
+	} else {
+		log.Printf("Warning: Poll sent but no poll ID returned")
+	}
+}
+
+// handleChannelQuizCommand processes the /channelquiz command
+// Format: /channelquiz channelID word
+// Example: /channelquiz -1001234567890 vocabulary
+func (bs *BotService) handleChannelQuizCommand(msg *tgbotapi.Message) {
+	args := strings.TrimSpace(msg.CommandArguments())
+	parts := strings.SplitN(args, " ", 2)
+
+	if len(parts) < 2 {
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID,
+			"Please provide both channel ID and word. Example: /channelquiz -1001234567890 vocabulary"))
+		return
+	}
+
+	// Parse channel ID
+	channelID, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil {
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID,
+			"Invalid channel ID. Please use a numeric ID like -1001234567890"))
+		return
+	}
+
+	word := parts[1]
+
+	// Let the user know we're generating a quiz
+	statusMsg := tgbotapi.NewMessage(msg.Chat.ID,
+		fmt.Sprintf("Generating quiz about '%s' for channel %d...", word, channelID))
+	bs.api.Send(statusMsg)
+
+	// Generate the quiz
+	quiz, err := bs.generateQuiz(word)
+	if err != nil {
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID,
+			fmt.Sprintf("Failed to generate quiz: %v", err)))
+		return
+	}
+
+	// Send the quiz to the specified channel
+	success := bs.sendQuizToChatID(channelID, quiz)
+
+	// Confirm successful sending
+	if success {
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID,
+			fmt.Sprintf("Quiz about '%s' has been sent to channel %d ✅", word, channelID)))
+	} else {
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID,
+			fmt.Sprintf("Failed to send quiz to channel %d. Is the bot an admin there?", channelID)))
+	}
+}
+
+// sendHourlyPoll creates and sends polls to activated channels
+// func (bs *BotService) sendHourlyPoll() {
+// 	log.Printf("Hourly poll scheduler triggered. Active channels: %d", len(bs.activeChannels))
+
+// 	if len(bs.activeChannels) == 0 {
+// 		log.Printf("No active channels, skipping hourly poll")
+// 		return
+// 	}
+
+// 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// 	defer cancel()
+
+// 	prompt := `
+// 	 Follow these response guidelines:
+//  1. DO NOT use markdown formatting (no asterisks for bold/italic),
+// 	Create a multiple-choice English vocabulary question. Return JSON:
+// {"question":"...","choices":["opt1","opt2","opt3","opt4"],"answer_index":<0-3>}.`
+
+// 	log.Printf("Generating quiz question...")
+// 	resp, err := bs.gemini.model.GenerateContent(ctx, genai.Text(prompt))
+// 	if err != nil {
+// 		log.Printf("Quiz generation error: %v", err)
+// 		return
+// 	}
+
+// 	var quiz struct {
+// 		Question    string   `json:"question"`
+// 		Choices     []string `json:"choices"`
+// 		AnswerIndex int      `json:"answer_index"`
+// 	}
+
+// 	raw := string(resp.Candidates[0].Content.Parts[0].(genai.Text))
+// 	log.Printf("Raw quiz response: %s", raw)
+
+// 	if err := json.Unmarshal([]byte(raw), &quiz); err != nil {
+// 		log.Printf("Quiz parse error: %v - raw: %s", err, raw)
+// 		return
+// 	}
+
+// 	// Validate quiz data
+// 	if quiz.Question == "" || len(quiz.Choices) != 4 || quiz.AnswerIndex < 0 || quiz.AnswerIndex > 3 {
+// 		log.Printf("Invalid quiz data: %+v", quiz)
+// 		return
+// 	}
+
+// 	log.Printf("Sending quiz: %s", quiz.Question)
+
+// 	for chatID := range bs.activeChannels {
+// 		log.Printf("Sending poll to chat ID: %d", chatID)
+
+// 		pollCfg := tgbotapi.SendPollConfig{
+// 			BaseChat:              tgbotapi.BaseChat{ChatID: chatID},
+// 			Question:              quiz.Question,
+// 			Options:               quiz.Choices,
+// 			IsAnonymous:           false,
+// 			AllowsMultipleAnswers: false,
+// 			Type:                  "quiz", // Make sure it's sent as a quiz
+// 		}
+
+// 		sent, err := bs.api.Send(pollCfg)
+// 		if err != nil {
+// 			log.Printf("Failed to send poll to %d: %v", chatID, err)
+// 			continue
+// 		}
+
+// 		if sent.Poll != nil {
+// 			log.Printf("Poll sent successfully, ID: %s", sent.Poll.ID)
+// 			bs.activePolls[sent.Poll.ID] = &PollData{
+// 				ChatID:        chatID,
+// 				MessageID:     sent.MessageID,
+// 				CorrectOption: quiz.AnswerIndex,
+// 				Options:       quiz.Choices,
+// 			}
+// 		} else {
+// 			log.Printf("Warning: Poll sent but no poll ID returned")
+// 		}
+// 	}
+// }
+
+// handleBroadcastQuizCommand processes the /broadcastquiz command
+// Format: /broadcastquiz word
+// // Example: /broadcastquiz vocabulary
+// func (bs *BotService) handleBroadcastQuizCommand(msg *tgbotapi.Message) {
+// 	// Extract the word parameter from the command
+// 	word := strings.TrimSpace(msg.CommandArguments())
+// 	if word == "" {
+// 		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID,
+// 			"Please provide a word after /broadcastquiz command. Example: /broadcastquiz vocabulary"))
+// 		return
+// 	}
+
+// 	// Let the user know we're starting the broadcast process
+// 	statusMsg := tgbotapi.NewMessage(msg.Chat.ID,
+// 		fmt.Sprintf("📢 Broadcasting quiz about '%s' to all active channels...", word))
+// 	bs.api.Send(statusMsg)
+
+// 	// Generate the quiz content once
+// 	quizData, err := bs.generateQuiz(word)
+// 	if err != nil {
+// 		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID,
+// 			fmt.Sprintf("Failed to generate quiz: %v", err)))
+// 		return
+// 	}
+
+// 	// Count active channels and successful broadcasts
+// 	channelCount := len(bs.activeChannels)
+// 	successCount := 0
+
+// 	// Send the quiz to all active channels
+// 	for chatID := range bs.activeChannels {
+// 		success := bs.sendQuizToChatID(chatID, quizData)
+// 		if success {
+// 			successCount++
+// 		}
+// 	}
+
+// 	// Report results to the user
+// 	resultMsg := fmt.Sprintf("Quiz about '%s' broadcast complete! ✅\n%d/%d channels received the quiz successfully.",
+// 		word, successCount, channelCount)
+// 	bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, resultMsg))
+// }
+
+// Define a struct to hold quiz data
+type QuizData struct {
+	Question    string
+	Choices     []string
+	AnswerIndex int
+}
+
+func (bs *BotService) generateQuiz(word string) (*QuizData, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Improved prompt with clearer JSON structure requirements
+	prompt := fmt.Sprintf(`
+	Create a multiple-choice English quiz about the word "%s". 
+	This could involve its meaning, synonyms, antonyms, usage in a sentence, or related concepts.
+
+	CRITICAL: You must return ONLY a valid, clean JSON object with NO explanation text before or after.
+	Format must be exactly as shown:
+	{
+	  "question": "Your question text here",
+	  "choices": ["Option 1", "Option 2", "Option 3", "Option 4"],
+	  "answer_index": n
+	}
+	
+	Where n is a number from 0-3 indicating the correct answer index.
+	NO backticks, NO markdown, NO code blocks, NO comments.`, word)
+
+	log.Printf("Generating quiz for word: %s", word)
+
+	// First attempt
+	resp, err := bs.gemini.model.GenerateContent(ctx, genai.Text(prompt))
+	if err != nil {
+		log.Printf("Quiz generation error on first attempt: %v", err)
+
+		// Try again with a simpler prompt
+		simplePrompt := fmt.Sprintf(`
+		Create a simple multiple-choice question about the word "%s".
+		Return ONLY valid JSON in this format with no other text:
+		{"question":"Question text","choices":["A","B","C","D"],"answer_index":0}`, word)
+
+		resp, err = bs.gemini.model.GenerateContent(ctx, genai.Text(simplePrompt))
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate quiz after retries: %v", err)
+		}
+	}
+
+	raw := string(resp.Candidates[0].Content.Parts[0].(genai.Text))
+	log.Printf("Raw quiz response: %s", raw)
+
+	// Clean the raw response
+	cleanedJSON := bs.extractJSON(raw)
+	log.Printf("Cleaned JSON: %s", cleanedJSON)
+
+	if cleanedJSON == "" {
+		return nil, fmt.Errorf("could not extract valid JSON from response")
+	}
+
+	var quiz QuizData
+	if err := json.Unmarshal([]byte(cleanedJSON), &quiz); err != nil {
+		// Try a manual approach if JSON parsing fails
+		log.Printf("Quiz parse error: %v - attempting manual parsing", err)
+
+		// Try to rebuild a valid JSON structure
+		question := extractBetween(raw, `"question"`, `"choices"`)
+		if question == "" {
+			question = extractBetween(raw, `"question"`, `choices`)
+		}
+
+		choices := extractChoicesArray(raw)
+		answerIndex := extractAnswerIndex(raw)
+
+		if question != "" && len(choices) == 4 && answerIndex >= 0 && answerIndex <= 3 {
+			return &QuizData{
+				Question:    strings.Trim(question, `"': ,`),
+				Choices:     choices,
+				AnswerIndex: answerIndex,
+			}, nil
+		}
+
+		return nil, fmt.Errorf("failed to parse quiz: %v", err)
+	}
+
+	// Validate quiz data
+	if quiz.Question == "" {
+		return nil, fmt.Errorf("quiz has empty question field")
+	}
+
+	if len(quiz.Choices) != 4 {
+		return nil, fmt.Errorf("expected 4 choices, got %d", len(quiz.Choices))
+	}
+
+	if quiz.AnswerIndex < 0 || quiz.AnswerIndex > 3 {
+		return nil, fmt.Errorf("answer index %d out of range", quiz.AnswerIndex)
+	}
+
+	return &quiz, nil
+}
+
+// Helper function to extract text between two markers
+func extractBetween(text, start, end string) string {
+	startIdx := strings.Index(text, start)
+	if startIdx == -1 {
+		return ""
+	}
+	startIdx += len(start)
+
+	// Skip any colon or whitespace
+	for startIdx < len(text) && (text[startIdx] == ':' || text[startIdx] == ' ' || text[startIdx] == '\n') {
+		startIdx++
+	}
+
+	endIdx := strings.Index(text[startIdx:], end)
+	if endIdx == -1 {
+		endIdx = len(text) - startIdx
+	}
+
+	return strings.TrimSpace(text[startIdx : startIdx+endIdx])
+}
+
+// Helper function to extract choices array
+func extractChoicesArray(text string) []string {
+	startIdx := strings.Index(text, `"choices"`)
+	if startIdx == -1 {
+		return []string{}
+	}
+
+	// Find opening bracket
+	bracketIdx := strings.Index(text[startIdx:], "[")
+	if bracketIdx == -1 {
+		return []string{}
+	}
+
+	startIdx += bracketIdx + 1
+
+	// Find closing bracket
+	endIdx := strings.Index(text[startIdx:], "]")
+	if endIdx == -1 {
+		return []string{}
+	}
+
+	choicesText := text[startIdx : startIdx+endIdx]
+
+	// Split by commas, but handle quoted strings properly
+	var choices []string
+	inQuote := false
+	start := 0
+
+	for i, char := range choicesText {
+		if char == '"' {
+			inQuote = !inQuote
+		} else if char == ',' && !inQuote {
+			choice := strings.Trim(choicesText[start:i], `" ,`)
+			choices = append(choices, choice)
+			start = i + 1
+		}
+	}
+
+	// Add the last choice
+	if start < len(choicesText) {
+		choice := strings.Trim(choicesText[start:], `" ,`)
+		choices = append(choices, choice)
+	}
+
+	// If parsing failed, try a simpler approach
+	if len(choices) != 4 {
+		choices = strings.Split(choicesText, ",")
+		for i := range choices {
+			choices[i] = strings.Trim(choices[i], `" ,`)
+		}
+	}
+
+	// Ensure we have exactly 4 choices
+	for len(choices) < 4 {
+		choices = append(choices, fmt.Sprintf("Option %d", len(choices)+1))
+	}
+
+	return choices[:4] // Return only the first 4 choices
+}
+
+// Helper function to extract answer index
+func extractAnswerIndex(text string) int {
+	startIdx := strings.Index(text, `"answer_index"`)
+	if startIdx == -1 {
+		return -1
+	}
+
+	// Find the value after the colon
+	colonIdx := strings.Index(text[startIdx:], ":")
+	if colonIdx == -1 {
+		return -1
+	}
+
+	startIdx += colonIdx + 1
+
+	// Extract the number
+	var numStr string
+	for i := startIdx; i < len(text); i++ {
+		if text[i] >= '0' && text[i] <= '9' {
+			numStr += string(text[i])
+		} else if len(numStr) > 0 {
+			break
+		}
+	}
+
+	if numStr == "" {
+		return -1
+	}
+
+	num, err := strconv.Atoi(numStr)
+	if err != nil || num < 0 || num > 3 {
+		return -1
+	}
+
+	return num
+}
+func (bs *BotService) extractJSON(text string) string {
+	// First attempt: find JSON between curly braces
+	startIndex := strings.Index(text, "{")
+	if startIndex == -1 {
+		return ""
+	}
+
+	// Find matching closing brace
+	level := 0
+	for i := startIndex; i < len(text); i++ {
+		if text[i] == '{' {
+			level++
+		} else if text[i] == '}' {
+			level--
+			if level == 0 {
+				// Found complete JSON object
+				return text[startIndex : i+1]
+			}
+		}
+	}
+
+	// If no proper JSON found, try a more aggressive approach
+	// Remove markdown code block markers if present
+	text = strings.Replace(text, "```json", "", -1)
+	text = strings.Replace(text, "```", "", -1)
+
+	// Find the first opening curly brace
+	startIndex = strings.Index(text, "{")
+	if startIndex == -1 {
+		return ""
+	}
+
+	// Find the last closing curly brace
+	endIndex := strings.LastIndex(text, "}")
+	if endIndex == -1 || endIndex < startIndex {
+		return ""
+	}
+
+	// Extract just the JSON part
+	return text[startIndex : endIndex+1]
+}
+
+// sendQuizToChatID sends a pre-generated quiz to a specific chat ID
+func (bs *BotService) sendQuizToChatID(chatID int64, quiz *QuizData) bool {
+	pollCfg := tgbotapi.SendPollConfig{
+		BaseChat:              tgbotapi.BaseChat{ChatID: chatID},
+		Question:              quiz.Question,
+		Options:               quiz.Choices,
+		IsAnonymous:           false,
+		AllowsMultipleAnswers: false,
+		Type:                  "quiz",
+	}
+
+	sent, err := bs.api.Send(pollCfg)
+	if err != nil {
+		log.Printf("Failed to send poll to %d: %v", chatID, err)
+		return false
+	}
+
+	if sent.Poll != nil {
+		log.Printf("Poll sent successfully to %d, ID: %s", chatID, sent.Poll.ID)
+		bs.activePolls[sent.Poll.ID] = &PollData{
+			ChatID:        chatID,
+			MessageID:     sent.MessageID,
+			CorrectOption: quiz.AnswerIndex,
+			Options:       quiz.Choices,
+		}
+		return true
+	} else {
+		log.Printf("Warning: Poll sent but no poll ID returned for chat %d", chatID)
+		return false
+	}
+}
+
+// sendChunks splits long messages into 4096-char chunks
+func (bs *BotService) sendChunks(msg tgbotapi.MessageConfig) {
+	const max = 4096
+	text := msg.Text
+	for i := 0; i < len(text); i += max {
+		end := i + max
 		if end > len(text) {
 			end = len(text)
 		}
-
-		chunk := tgbotapi.NewMessage(response.ChatID, text[i:end])
-		if _, err := bs.api.Send(chunk); err != nil {
-			log.Printf("failed to send message chunk: %v", err)
-		}
+		chunk := tgbotapi.NewMessage(msg.ChatID, text[i:end])
+		chunk.ReplyToMessageID = msg.ReplyToMessageID
+		bs.api.Send(chunk)
 	}
 }
 
 func main() {
 	cfg, err := LoadConfig()
 	if err != nil {
-		log.Fatalf("Fatal configuration error: %v", err)
+		log.Fatalf("Configuration error: %v", err)
 	}
 	bot := NewBotService(cfg)
 	defer bot.gemini.Close()
