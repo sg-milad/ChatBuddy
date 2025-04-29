@@ -124,30 +124,23 @@ func NewBotService(cfg *Config) *BotService {
 	return bs
 }
 
-// Run starts receiving updates with robust conflict handling
+// Run starts receiving updates with direct handling
 func (bs *BotService) Run() {
 	// Configure update parameters
 	updateConfig := tgbotapi.NewUpdate(0)
 	updateConfig.Timeout = 60
 	updateConfig.AllowedUpdates = []string{"message", "channel_post", "poll_answer"}
 
-	// Base delay values for backoff
-	baseDelay := 5 * time.Second
-	maxDelay := 60 * time.Second
-	currentDelay := baseDelay
-
-	// Main loop - don't use GetUpdatesChan which can cause issues with conflict errors
+	// Main loop - don't use GetUpdatesChan
 	for {
-		// Get updates directly instead of using the channel
+		// Get updates directly
 		updates, err := bs.api.GetUpdates(updateConfig)
 
 		if err != nil {
-			// Check if it's a conflict error
-			if strings.Contains(err.Error(), "Conflict") {
-				log.Printf("Conflict detected: %v", err)
-				log.Printf("Waiting %v before retrying...", currentDelay)
+			log.Printf("Error getting updates: %v", err)
 
-				// Clear the webhook explicitly to resolve conflict
+			// Handle conflict error by explicitly clearing the webhook
+			if strings.Contains(err.Error(), "Conflict") {
 				_, clearErr := bs.api.Request(tgbotapi.DeleteWebhookConfig{
 					DropPendingUpdates: false,
 				})
@@ -155,24 +148,12 @@ func (bs *BotService) Run() {
 				if clearErr != nil {
 					log.Printf("Failed to clear webhook: %v", clearErr)
 				}
-
-				// Exponential backoff with ceiling
-				time.Sleep(currentDelay)
-				currentDelay *= 2
-				if currentDelay > maxDelay {
-					currentDelay = maxDelay
-				}
-				continue
 			}
 
-			// For non-conflict errors
-			log.Printf("Error getting updates: %v", err)
+			// Simple fixed delay
 			time.Sleep(3 * time.Second)
 			continue
 		}
-
-		// Reset delay on success
-		currentDelay = baseDelay
 
 		// Process updates
 		for _, update := range updates {
