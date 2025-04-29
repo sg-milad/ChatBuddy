@@ -125,12 +125,65 @@ func NewBotService(cfg *Config) *BotService {
 }
 
 // Run starts receiving updates and handles both messages and channel posts
+// Run starts receiving updates and handles both messages and channel posts
 func (bs *BotService) Run() {
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	u.AllowedUpdates = []string{"message", "channel_post", "poll_answer"}
-	updates := bs.api.GetUpdatesChan(u)
 
+	// Retry configuration for getUpdates
+	maxRetries := 5
+	initialBackoff := 1 * time.Second
+	maxBackoff := 30 * time.Second
+
+	var updates tgbotapi.UpdatesChannel
+	var err error
+
+	// Try to establish updates channel with retry
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Attempt to get updates channel
+		updates = bs.api.GetUpdatesChan(u)
+
+		// Verify the channel works by trying to get one update
+		select {
+		case _, ok := <-updates:
+			if ok {
+				// Channel is working properly
+				log.Printf("Successfully established updates channel")
+				goto processUpdates // Skip to processing loop
+			}
+		case <-time.After(5 * time.Second):
+			// If we don't get an update within timeout, consider it a failure
+			// This also catches error 409 conflict cases
+			err = fmt.Errorf("update channel timeout or conflict")
+		}
+
+		if attempt < maxRetries-1 {
+			// Calculate backoff with exponential increase
+			backoff := initialBackoff * time.Duration(1<<attempt)
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+
+			// Add jitter (±20%)
+			jitter := time.Duration(float64(backoff) * (0.8 + 0.4*rand.Float64()))
+
+			log.Printf("getUpdates failed (attempt %d/%d): %v, retrying in %v...",
+				attempt+1, maxRetries, err, jitter)
+
+			// For error 409, it's necessary to wait a bit longer to ensure the previous
+			// connection is fully terminated by Telegram's servers
+			time.Sleep(jitter)
+		}
+	}
+
+	// If we got here, all retries failed, panic with error
+	if err != nil {
+		log.Panicf("failed to establish updates channel after %d attempts: %v", maxRetries, err)
+	}
+
+processUpdates:
+	// Process updates from the channel
 	for update := range updates {
 		// Immediate PollAnswer handling
 		if pa := update.PollAnswer; pa != nil {
