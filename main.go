@@ -85,7 +85,6 @@ func NewBotService(cfg *Config) *BotService {
 	// Initialize Telegram bot with retries
 	var bot *tgbotapi.BotAPI
 	var err error
-	bot.Debug = true
 	maxRetries := 5
 	initialBackoff := 1 * time.Second
 	maxBackoff := 30 * time.Second
@@ -119,6 +118,7 @@ func NewBotService(cfg *Config) *BotService {
 
 	// Add a test entry to confirm activation works
 	bs.activeChannels[123456789] = true
+	bot.Debug = true
 
 	// Schedule hourly quiz - run at minute 0 of every hour
 	entryID, err := bs.cron.AddFunc("0 * * * *", bs.sendHourlyPoll)
