@@ -11,7 +11,6 @@ import (
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/google/generative-ai-go/genai"
-	"github.com/robfig/cron/v3"
 	"google.golang.org/api/option"
 )
 
@@ -30,9 +29,9 @@ type GeminiService struct {
 
 // BotService is the main service struct
 type BotService struct {
-	api            *tgbotapi.BotAPI
-	gemini         *GeminiService
-	cron           *cron.Cron
+	api    *tgbotapi.BotAPI
+	gemini *GeminiService
+	// cron           *cron.Cron
 	activeChannels map[int64]bool       // chatID → enabled/disabled
 	activePolls    map[string]*PollData // pollID → PollData
 }
@@ -87,9 +86,9 @@ func NewBotService(cfg *Config) *BotService {
 	}
 
 	bs := &BotService{
-		api:            bot,
-		gemini:         NewGeminiService(cfg.GeminiAPIKey),
-		cron:           cron.New(cron.WithLocation(time.UTC)),
+		api:    bot,
+		gemini: NewGeminiService(cfg.GeminiAPIKey),
+		// cron:           cron.New(cron.WithLocation(time.UTC)),
 		activeChannels: make(map[int64]bool),
 		activePolls:    make(map[string]*PollData),
 	}
@@ -97,21 +96,21 @@ func NewBotService(cfg *Config) *BotService {
 	bot.Debug = true
 
 	// Schedule hourly quiz - run at minute 0 of every hour
-	entryID, err := bs.cron.AddFunc("0 * * * *", bs.sendHourlyPoll)
-	if err != nil {
-		log.Printf("Error scheduling cron job: %v", err)
-	}
+	// entryID, err := bs.cron.AddFunc("0 * * * *", bs.sendHourlyPoll)
+	// if err != nil {
+	// 	log.Printf("Error scheduling cron job: %v", err)
+	// }
 
-	log.Printf("Successfully scheduled hourly quiz, entry ID: %v", entryID)
+	// log.Printf("Successfully scheduled hourly quiz, entry ID: %v", entryID)
 
-	// Start the scheduler
-	bs.cron.Start()
+	// // Start the scheduler
+	// bs.cron.Start()
 
-	// Log the next run times for verification
-	entries := bs.cron.Entries()
-	for _, entry := range entries {
-		log.Printf("Cron job ID %d scheduled, next run: %v", entry.ID, entry.Next)
-	}
+	// // Log the next run times for verification
+	// entries := bs.cron.Entries()
+	// for _, entry := range entries {
+	// 	log.Printf("Cron job ID %d scheduled, next run: %v", entry.ID, entry.Next)
+	// }
 
 	log.Printf("authorized as @%s, scheduler started", bot.Self.UserName)
 	return bs
@@ -193,7 +192,7 @@ func (bs *BotService) Run() {
 	}
 }
 
-// handleCommand processes bot commands for both messages and channel posts
+// 1. Modify the activate command to properly store channel IDs
 func (bs *BotService) handleCommand(msg *tgbotapi.Message) {
 	switch msg.Command() {
 	case "start":
@@ -208,7 +207,7 @@ func (bs *BotService) handleCommand(msg *tgbotapi.Message) {
 
 	case "activate":
 		bs.activeChannels[msg.Chat.ID] = true
-		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, "✅ Quizzes activated in this chat."))
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("✅ Quizzes activated in this chat (ID: %d).", msg.Chat.ID)))
 
 	case "deactivate":
 		delete(bs.activeChannels, msg.Chat.ID)
@@ -223,9 +222,75 @@ func (bs *BotService) handleCommand(msg *tgbotapi.Message) {
 	case "broadcastquiz":
 		bs.handleBroadcastQuizCommand(msg)
 
+	case "getid":
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, fmt.Sprintf("Chat ID: %d", msg.Chat.ID)))
+
 	default:
 		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, unknownCmdMsg))
 	}
+}
+
+// 2. Modify the broadcast function to correctly identify channels
+func (bs *BotService) handleBroadcastQuizCommand(msg *tgbotapi.Message) {
+	// Extract the word parameter from the command
+	word := strings.TrimSpace(msg.CommandArguments())
+	if word == "" {
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID,
+			"Please provide a word after /broadcastquiz command. Example: /broadcastquiz vocabulary"))
+		return
+	}
+
+	// Let the user know we're starting the broadcast process
+	statusMsg := tgbotapi.NewMessage(msg.Chat.ID,
+		fmt.Sprintf("📢 Broadcasting quiz about '%s' to all active channels...", word))
+	bs.api.Send(statusMsg)
+
+	// Generate the quiz content once
+	quizData, err := bs.generateQuiz(word)
+	if err != nil {
+		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID,
+			fmt.Sprintf("Failed to generate quiz: %v", err)))
+		return
+	}
+
+	// Count active channels and successful broadcasts
+	channelCount := len(bs.activeChannels)
+	successCount := 0
+	sentToList := []int64{}
+
+	// Skip sending to the current chat if it's a private chat with the bot
+	skipCurrentChat := msg.Chat.Type == "private"
+
+	// Send the quiz to all active channels
+	for chatID := range bs.activeChannels {
+		// Skip the current chat ID if it's a private chat
+		if skipCurrentChat && chatID == msg.Chat.ID {
+			continue
+		}
+
+		success := bs.sendQuizToChatID(chatID, quizData)
+		if success {
+			successCount++
+			sentToList = append(sentToList, chatID)
+		}
+	}
+
+	// Report results to the user with detailed info
+	resultMsg := fmt.Sprintf("Quiz about '%s' broadcast complete! ✅\n%d/%d channels received the quiz successfully.",
+		word, successCount, channelCount)
+
+	// Add list of chat IDs where the quiz was sent
+	if len(sentToList) > 0 {
+		resultMsg += "\nSent to chat IDs: "
+		for i, id := range sentToList {
+			if i > 0 {
+				resultMsg += ", "
+			}
+			resultMsg += fmt.Sprintf("%d", id)
+		}
+	}
+
+	bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, resultMsg))
 }
 
 // handleQuery handles bot mentions and replies
@@ -284,6 +349,7 @@ func (bs *BotService) handleQuizCommand(msg *tgbotapi.Message) {
 	// Generate and send the quiz
 	bs.createAndSendQuiz(msg.Chat.ID, args)
 }
+
 func (bs *BotService) createAndSendQuiz(chatID int64, word string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -427,126 +493,126 @@ func (bs *BotService) handleChannelQuizCommand(msg *tgbotapi.Message) {
 }
 
 // sendHourlyPoll creates and sends polls to activated channels
-func (bs *BotService) sendHourlyPoll() {
-	log.Printf("Hourly poll scheduler triggered. Active channels: %d", len(bs.activeChannels))
+// func (bs *BotService) sendHourlyPoll() {
+// 	log.Printf("Hourly poll scheduler triggered. Active channels: %d", len(bs.activeChannels))
 
-	if len(bs.activeChannels) == 0 {
-		log.Printf("No active channels, skipping hourly poll")
-		return
-	}
+// 	if len(bs.activeChannels) == 0 {
+// 		log.Printf("No active channels, skipping hourly poll")
+// 		return
+// 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+// 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+// 	defer cancel()
 
-	prompt := `
-	 Follow these response guidelines:
- 1. DO NOT use markdown formatting (no asterisks for bold/italic),
-	Create a multiple-choice English vocabulary question. Return JSON:
-{"question":"...","choices":["opt1","opt2","opt3","opt4"],"answer_index":<0-3>}.`
+// 	prompt := `
+// 	 Follow these response guidelines:
+//  1. DO NOT use markdown formatting (no asterisks for bold/italic),
+// 	Create a multiple-choice English vocabulary question. Return JSON:
+// {"question":"...","choices":["opt1","opt2","opt3","opt4"],"answer_index":<0-3>}.`
 
-	log.Printf("Generating quiz question...")
-	resp, err := bs.gemini.model.GenerateContent(ctx, genai.Text(prompt))
-	if err != nil {
-		log.Printf("Quiz generation error: %v", err)
-		return
-	}
+// 	log.Printf("Generating quiz question...")
+// 	resp, err := bs.gemini.model.GenerateContent(ctx, genai.Text(prompt))
+// 	if err != nil {
+// 		log.Printf("Quiz generation error: %v", err)
+// 		return
+// 	}
 
-	var quiz struct {
-		Question    string   `json:"question"`
-		Choices     []string `json:"choices"`
-		AnswerIndex int      `json:"answer_index"`
-	}
+// 	var quiz struct {
+// 		Question    string   `json:"question"`
+// 		Choices     []string `json:"choices"`
+// 		AnswerIndex int      `json:"answer_index"`
+// 	}
 
-	raw := string(resp.Candidates[0].Content.Parts[0].(genai.Text))
-	log.Printf("Raw quiz response: %s", raw)
+// 	raw := string(resp.Candidates[0].Content.Parts[0].(genai.Text))
+// 	log.Printf("Raw quiz response: %s", raw)
 
-	if err := json.Unmarshal([]byte(raw), &quiz); err != nil {
-		log.Printf("Quiz parse error: %v - raw: %s", err, raw)
-		return
-	}
+// 	if err := json.Unmarshal([]byte(raw), &quiz); err != nil {
+// 		log.Printf("Quiz parse error: %v - raw: %s", err, raw)
+// 		return
+// 	}
 
-	// Validate quiz data
-	if quiz.Question == "" || len(quiz.Choices) != 4 || quiz.AnswerIndex < 0 || quiz.AnswerIndex > 3 {
-		log.Printf("Invalid quiz data: %+v", quiz)
-		return
-	}
+// 	// Validate quiz data
+// 	if quiz.Question == "" || len(quiz.Choices) != 4 || quiz.AnswerIndex < 0 || quiz.AnswerIndex > 3 {
+// 		log.Printf("Invalid quiz data: %+v", quiz)
+// 		return
+// 	}
 
-	log.Printf("Sending quiz: %s", quiz.Question)
+// 	log.Printf("Sending quiz: %s", quiz.Question)
 
-	for chatID := range bs.activeChannels {
-		log.Printf("Sending poll to chat ID: %d", chatID)
+// 	for chatID := range bs.activeChannels {
+// 		log.Printf("Sending poll to chat ID: %d", chatID)
 
-		pollCfg := tgbotapi.SendPollConfig{
-			BaseChat:              tgbotapi.BaseChat{ChatID: chatID},
-			Question:              quiz.Question,
-			Options:               quiz.Choices,
-			IsAnonymous:           false,
-			AllowsMultipleAnswers: false,
-			Type:                  "quiz", // Make sure it's sent as a quiz
-		}
+// 		pollCfg := tgbotapi.SendPollConfig{
+// 			BaseChat:              tgbotapi.BaseChat{ChatID: chatID},
+// 			Question:              quiz.Question,
+// 			Options:               quiz.Choices,
+// 			IsAnonymous:           false,
+// 			AllowsMultipleAnswers: false,
+// 			Type:                  "quiz", // Make sure it's sent as a quiz
+// 		}
 
-		sent, err := bs.api.Send(pollCfg)
-		if err != nil {
-			log.Printf("Failed to send poll to %d: %v", chatID, err)
-			continue
-		}
+// 		sent, err := bs.api.Send(pollCfg)
+// 		if err != nil {
+// 			log.Printf("Failed to send poll to %d: %v", chatID, err)
+// 			continue
+// 		}
 
-		if sent.Poll != nil {
-			log.Printf("Poll sent successfully, ID: %s", sent.Poll.ID)
-			bs.activePolls[sent.Poll.ID] = &PollData{
-				ChatID:        chatID,
-				MessageID:     sent.MessageID,
-				CorrectOption: quiz.AnswerIndex,
-				Options:       quiz.Choices,
-			}
-		} else {
-			log.Printf("Warning: Poll sent but no poll ID returned")
-		}
-	}
-}
+// 		if sent.Poll != nil {
+// 			log.Printf("Poll sent successfully, ID: %s", sent.Poll.ID)
+// 			bs.activePolls[sent.Poll.ID] = &PollData{
+// 				ChatID:        chatID,
+// 				MessageID:     sent.MessageID,
+// 				CorrectOption: quiz.AnswerIndex,
+// 				Options:       quiz.Choices,
+// 			}
+// 		} else {
+// 			log.Printf("Warning: Poll sent but no poll ID returned")
+// 		}
+// 	}
+// }
 
 // handleBroadcastQuizCommand processes the /broadcastquiz command
 // Format: /broadcastquiz word
-// Example: /broadcastquiz vocabulary
-func (bs *BotService) handleBroadcastQuizCommand(msg *tgbotapi.Message) {
-	// Extract the word parameter from the command
-	word := strings.TrimSpace(msg.CommandArguments())
-	if word == "" {
-		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID,
-			"Please provide a word after /broadcastquiz command. Example: /broadcastquiz vocabulary"))
-		return
-	}
+// // Example: /broadcastquiz vocabulary
+// func (bs *BotService) handleBroadcastQuizCommand(msg *tgbotapi.Message) {
+// 	// Extract the word parameter from the command
+// 	word := strings.TrimSpace(msg.CommandArguments())
+// 	if word == "" {
+// 		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID,
+// 			"Please provide a word after /broadcastquiz command. Example: /broadcastquiz vocabulary"))
+// 		return
+// 	}
 
-	// Let the user know we're starting the broadcast process
-	statusMsg := tgbotapi.NewMessage(msg.Chat.ID,
-		fmt.Sprintf("📢 Broadcasting quiz about '%s' to all active channels...", word))
-	bs.api.Send(statusMsg)
+// 	// Let the user know we're starting the broadcast process
+// 	statusMsg := tgbotapi.NewMessage(msg.Chat.ID,
+// 		fmt.Sprintf("📢 Broadcasting quiz about '%s' to all active channels...", word))
+// 	bs.api.Send(statusMsg)
 
-	// Generate the quiz content once
-	quizData, err := bs.generateQuiz(word)
-	if err != nil {
-		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID,
-			fmt.Sprintf("Failed to generate quiz: %v", err)))
-		return
-	}
+// 	// Generate the quiz content once
+// 	quizData, err := bs.generateQuiz(word)
+// 	if err != nil {
+// 		bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID,
+// 			fmt.Sprintf("Failed to generate quiz: %v", err)))
+// 		return
+// 	}
 
-	// Count active channels and successful broadcasts
-	channelCount := len(bs.activeChannels)
-	successCount := 0
+// 	// Count active channels and successful broadcasts
+// 	channelCount := len(bs.activeChannels)
+// 	successCount := 0
 
-	// Send the quiz to all active channels
-	for chatID := range bs.activeChannels {
-		success := bs.sendQuizToChatID(chatID, quizData)
-		if success {
-			successCount++
-		}
-	}
+// 	// Send the quiz to all active channels
+// 	for chatID := range bs.activeChannels {
+// 		success := bs.sendQuizToChatID(chatID, quizData)
+// 		if success {
+// 			successCount++
+// 		}
+// 	}
 
-	// Report results to the user
-	resultMsg := fmt.Sprintf("Quiz about '%s' broadcast complete! ✅\n%d/%d channels received the quiz successfully.",
-		word, successCount, channelCount)
-	bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, resultMsg))
-}
+// 	// Report results to the user
+// 	resultMsg := fmt.Sprintf("Quiz about '%s' broadcast complete! ✅\n%d/%d channels received the quiz successfully.",
+// 		word, successCount, channelCount)
+// 	bs.api.Send(tgbotapi.NewMessage(msg.Chat.ID, resultMsg))
+// }
 
 // Define a struct to hold quiz data
 type QuizData struct {
@@ -555,45 +621,82 @@ type QuizData struct {
 	AnswerIndex int
 }
 
-// generateQuiz creates a quiz about a specific word
 func (bs *BotService) generateQuiz(word string) (*QuizData, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	// Modified prompt to strongly emphasize no markdown and clean JSON
+	// Improved prompt with clearer JSON structure requirements
 	prompt := fmt.Sprintf(`
 	Create a multiple-choice English quiz about the word "%s". 
 	This could involve its meaning, synonyms, antonyms, usage in a sentence, or related concepts.
 
-	VERY IMPORTANT: Return ONLY raw JSON with NO markdown formatting, NO code blocks, NO backticks.
-	Just the plain JSON object in this exact format:
-	{"question":"...","choices":["opt1","opt2","opt3","opt4"],"answer_index":<0-3>}
+	CRITICAL: You must return ONLY a valid, clean JSON object with NO explanation text before or after.
+	Format must be exactly as shown:
+	{
+	  "question": "Your question text here",
+	  "choices": ["Option 1", "Option 2", "Option 3", "Option 4"],
+	  "answer_index": n
+	}
 	
-	The response must start with { and end with } with no other text before or after.`, word)
+	Where n is a number from 0-3 indicating the correct answer index.
+	NO backticks, NO markdown, NO code blocks, NO comments.`, word)
 
 	log.Printf("Generating quiz for word: %s", word)
+
+	// First attempt
 	resp, err := bs.gemini.model.GenerateContent(ctx, genai.Text(prompt))
 	if err != nil {
-		log.Printf("Quiz generation error: %v", err)
-		return nil, fmt.Errorf("failed to generate quiz: %v", err)
+		log.Printf("Quiz generation error on first attempt: %v", err)
+
+		// Try again with a simpler prompt
+		simplePrompt := fmt.Sprintf(`
+		Create a simple multiple-choice question about the word "%s".
+		Return ONLY valid JSON in this format with no other text:
+		{"question":"Question text","choices":["A","B","C","D"],"answer_index":0}`, word)
+
+		resp, err = bs.gemini.model.GenerateContent(ctx, genai.Text(simplePrompt))
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate quiz after retries: %v", err)
+		}
 	}
 
-	var quiz QuizData
-
-	// Extract raw response and clean it up
 	raw := string(resp.Candidates[0].Content.Parts[0].(genai.Text))
 	log.Printf("Raw quiz response: %s", raw)
 
-	// Clean the raw response by extracting just the JSON part
+	// Clean the raw response
 	cleanedJSON := bs.extractJSON(raw)
 	log.Printf("Cleaned JSON: %s", cleanedJSON)
 
+	if cleanedJSON == "" {
+		return nil, fmt.Errorf("could not extract valid JSON from response")
+	}
+
+	var quiz QuizData
 	if err := json.Unmarshal([]byte(cleanedJSON), &quiz); err != nil {
-		log.Printf("Quiz parse error: %v - raw: %s", err, raw)
+		// Try a manual approach if JSON parsing fails
+		log.Printf("Quiz parse error: %v - attempting manual parsing", err)
+
+		// Try to rebuild a valid JSON structure
+		question := extractBetween(raw, `"question"`, `"choices"`)
+		if question == "" {
+			question = extractBetween(raw, `"question"`, `choices`)
+		}
+
+		choices := extractChoicesArray(raw)
+		answerIndex := extractAnswerIndex(raw)
+
+		if question != "" && len(choices) == 4 && answerIndex >= 0 && answerIndex <= 3 {
+			return &QuizData{
+				Question:    strings.Trim(question, `"': ,`),
+				Choices:     choices,
+				AnswerIndex: answerIndex,
+			}, nil
+		}
+
 		return nil, fmt.Errorf("failed to parse quiz: %v", err)
 	}
 
-	// Validate quiz data with detailed error logging
+	// Validate quiz data
 	if quiz.Question == "" {
 		return nil, fmt.Errorf("quiz has empty question field")
 	}
@@ -609,15 +712,151 @@ func (bs *BotService) generateQuiz(word string) (*QuizData, error) {
 	return &quiz, nil
 }
 
-// extractJSON finds and extracts valid JSON from a string
-// even if it's wrapped in markdown code blocks or has extra text
+// Helper function to extract text between two markers
+func extractBetween(text, start, end string) string {
+	startIdx := strings.Index(text, start)
+	if startIdx == -1 {
+		return ""
+	}
+	startIdx += len(start)
+
+	// Skip any colon or whitespace
+	for startIdx < len(text) && (text[startIdx] == ':' || text[startIdx] == ' ' || text[startIdx] == '\n') {
+		startIdx++
+	}
+
+	endIdx := strings.Index(text[startIdx:], end)
+	if endIdx == -1 {
+		endIdx = len(text) - startIdx
+	}
+
+	return strings.TrimSpace(text[startIdx : startIdx+endIdx])
+}
+
+// Helper function to extract choices array
+func extractChoicesArray(text string) []string {
+	startIdx := strings.Index(text, `"choices"`)
+	if startIdx == -1 {
+		return []string{}
+	}
+
+	// Find opening bracket
+	bracketIdx := strings.Index(text[startIdx:], "[")
+	if bracketIdx == -1 {
+		return []string{}
+	}
+
+	startIdx += bracketIdx + 1
+
+	// Find closing bracket
+	endIdx := strings.Index(text[startIdx:], "]")
+	if endIdx == -1 {
+		return []string{}
+	}
+
+	choicesText := text[startIdx : startIdx+endIdx]
+
+	// Split by commas, but handle quoted strings properly
+	var choices []string
+	inQuote := false
+	start := 0
+
+	for i, char := range choicesText {
+		if char == '"' {
+			inQuote = !inQuote
+		} else if char == ',' && !inQuote {
+			choice := strings.Trim(choicesText[start:i], `" ,`)
+			choices = append(choices, choice)
+			start = i + 1
+		}
+	}
+
+	// Add the last choice
+	if start < len(choicesText) {
+		choice := strings.Trim(choicesText[start:], `" ,`)
+		choices = append(choices, choice)
+	}
+
+	// If parsing failed, try a simpler approach
+	if len(choices) != 4 {
+		choices = strings.Split(choicesText, ",")
+		for i := range choices {
+			choices[i] = strings.Trim(choices[i], `" ,`)
+		}
+	}
+
+	// Ensure we have exactly 4 choices
+	for len(choices) < 4 {
+		choices = append(choices, fmt.Sprintf("Option %d", len(choices)+1))
+	}
+
+	return choices[:4] // Return only the first 4 choices
+}
+
+// Helper function to extract answer index
+func extractAnswerIndex(text string) int {
+	startIdx := strings.Index(text, `"answer_index"`)
+	if startIdx == -1 {
+		return -1
+	}
+
+	// Find the value after the colon
+	colonIdx := strings.Index(text[startIdx:], ":")
+	if colonIdx == -1 {
+		return -1
+	}
+
+	startIdx += colonIdx + 1
+
+	// Extract the number
+	var numStr string
+	for i := startIdx; i < len(text); i++ {
+		if text[i] >= '0' && text[i] <= '9' {
+			numStr += string(text[i])
+		} else if len(numStr) > 0 {
+			break
+		}
+	}
+
+	if numStr == "" {
+		return -1
+	}
+
+	num, err := strconv.Atoi(numStr)
+	if err != nil || num < 0 || num > 3 {
+		return -1
+	}
+
+	return num
+}
 func (bs *BotService) extractJSON(text string) string {
+	// First attempt: find JSON between curly braces
+	startIndex := strings.Index(text, "{")
+	if startIndex == -1 {
+		return ""
+	}
+
+	// Find matching closing brace
+	level := 0
+	for i := startIndex; i < len(text); i++ {
+		if text[i] == '{' {
+			level++
+		} else if text[i] == '}' {
+			level--
+			if level == 0 {
+				// Found complete JSON object
+				return text[startIndex : i+1]
+			}
+		}
+	}
+
+	// If no proper JSON found, try a more aggressive approach
 	// Remove markdown code block markers if present
 	text = strings.Replace(text, "```json", "", -1)
 	text = strings.Replace(text, "```", "", -1)
 
 	// Find the first opening curly brace
-	startIndex := strings.Index(text, "{")
+	startIndex = strings.Index(text, "{")
 	if startIndex == -1 {
 		return ""
 	}
