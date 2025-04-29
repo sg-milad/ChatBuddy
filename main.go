@@ -124,100 +124,98 @@ func NewBotService(cfg *Config) *BotService {
 	return bs
 }
 
-// Run starts receiving updates and handles both messages and channel posts
-// Run starts receiving updates and handles both messages and channel posts
+// Run starts receiving updates with robust conflict handling
 func (bs *BotService) Run() {
-	u := tgbotapi.NewUpdate(0)
-	u.Timeout = 60
-	u.AllowedUpdates = []string{"message", "channel_post", "poll_answer"}
+	// Configure update parameters
+	updateConfig := tgbotapi.NewUpdate(0)
+	updateConfig.Timeout = 60
+	updateConfig.AllowedUpdates = []string{"message", "channel_post", "poll_answer"}
 
-	// Retry configuration for getUpdates
-	maxRetries := 5
-	initialBackoff := 1 * time.Second
-	maxBackoff := 30 * time.Second
+	// Base delay values for backoff
+	baseDelay := 5 * time.Second
+	maxDelay := 60 * time.Second
+	currentDelay := baseDelay
 
-	var updates tgbotapi.UpdatesChannel
-	var err error
+	// Main loop - don't use GetUpdatesChan which can cause issues with conflict errors
+	for {
+		// Get updates directly instead of using the channel
+		updates, err := bs.api.GetUpdates(updateConfig)
 
-	// Try to establish updates channel with retry
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		// Attempt to get updates channel
-		updates = bs.api.GetUpdatesChan(u)
+		if err != nil {
+			// Check if it's a conflict error
+			if strings.Contains(err.Error(), "Conflict") {
+				log.Printf("Conflict detected: %v", err)
+				log.Printf("Waiting %v before retrying...", currentDelay)
 
-		// Verify the channel works by trying to get one update
-		select {
-		case _, ok := <-updates:
-			if ok {
-				// Channel is working properly
-				log.Printf("Successfully established updates channel")
-				goto processUpdates // Skip to processing loop
+				// Clear the webhook explicitly to resolve conflict
+				_, clearErr := bs.api.Request(tgbotapi.DeleteWebhookConfig{
+					DropPendingUpdates: false,
+				})
+
+				if clearErr != nil {
+					log.Printf("Failed to clear webhook: %v", clearErr)
+				}
+
+				// Exponential backoff with ceiling
+				time.Sleep(currentDelay)
+				currentDelay *= 2
+				if currentDelay > maxDelay {
+					currentDelay = maxDelay
+				}
+				continue
 			}
-		case <-time.After(5 * time.Second):
-			// If we don't get an update within timeout, consider it a failure
-			// This also catches error 409 conflict cases
-			err = fmt.Errorf("update channel timeout or conflict")
-		}
 
-		if attempt < maxRetries-1 {
-			// Calculate backoff with exponential increase
-			backoff := initialBackoff * time.Duration(1<<attempt)
-			if backoff > maxBackoff {
-				backoff = maxBackoff
-			}
-
-			// Add jitter (±20%)
-			jitter := time.Duration(float64(backoff) * (0.8 + 0.4*rand.Float64()))
-
-			log.Printf("getUpdates failed (attempt %d/%d): %v, retrying in %v...",
-				attempt+1, maxRetries, err, jitter)
-
-			// For error 409, it's necessary to wait a bit longer to ensure the previous
-			// connection is fully terminated by Telegram's servers
-			time.Sleep(jitter)
-		}
-	}
-
-	// If we got here, all retries failed, panic with error
-	if err != nil {
-		log.Panicf("failed to establish updates channel after %d attempts: %v", maxRetries, err)
-	}
-
-processUpdates:
-	// Process updates from the channel
-	for update := range updates {
-		// Immediate PollAnswer handling
-		if pa := update.PollAnswer; pa != nil {
-			if pd, ok := bs.activePolls[pa.PollID]; ok {
-				reveal := fmt.Sprintf(
-					"✅ The correct answer is option %d: %s",
-					pd.CorrectOption+1,
-					pd.Options[pd.CorrectOption],
-				)
-				msg := tgbotapi.NewMessage(pd.ChatID, reveal)
-				msg.ReplyToMessageID = pd.MessageID
-				bs.api.Send(msg)
-				delete(bs.activePolls, pa.PollID)
-			}
+			// For non-conflict errors
+			log.Printf("Error getting updates: %v", err)
+			time.Sleep(3 * time.Second)
 			continue
 		}
 
-		// Handle channel posts (commands in channels)
-		if cp := update.ChannelPost; cp != nil {
-			if cp.IsCommand() {
-				bs.handleCommand(cp)
+		// Reset delay on success
+		currentDelay = baseDelay
+
+		// Process updates
+		for _, update := range updates {
+			// Update offset for next polling
+			updateConfig.Offset = update.UpdateID + 1
+
+			// Handle poll answers
+			if pa := update.PollAnswer; pa != nil {
+				if pd, ok := bs.activePolls[pa.PollID]; ok {
+					reveal := fmt.Sprintf(
+						"✅ The correct answer is option %d: %s",
+						pd.CorrectOption+1,
+						pd.Options[pd.CorrectOption],
+					)
+					msg := tgbotapi.NewMessage(pd.ChatID, reveal)
+					msg.ReplyToMessageID = pd.MessageID
+					bs.api.Send(msg)
+					delete(bs.activePolls, pa.PollID)
+				}
+				continue
 			}
-			continue
+
+			// Handle channel posts
+			if cp := update.ChannelPost; cp != nil {
+				if cp.IsCommand() {
+					bs.handleCommand(cp)
+				}
+				continue
+			}
+
+			// Handle private/group messages
+			if msg := update.Message; msg != nil {
+				if msg.IsCommand() {
+					bs.handleCommand(msg)
+				} else if bs.isBotMentioned(msg.Text) ||
+					(msg.ReplyToMessage != nil && msg.ReplyToMessage.From.ID == bs.api.Self.ID) {
+					bs.handleQuery(msg)
+				}
+			}
 		}
 
-		// Handle private/group messages
-		if msg := update.Message; msg != nil {
-			if msg.IsCommand() {
-				bs.handleCommand(msg)
-			} else if bs.isBotMentioned(msg.Text) ||
-				(msg.ReplyToMessage != nil && msg.ReplyToMessage.From.ID == bs.api.Self.ID) {
-				bs.handleQuery(msg)
-			}
-		}
+		// Small pause to prevent CPU spinning on rapid polling
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
