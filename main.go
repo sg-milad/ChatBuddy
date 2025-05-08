@@ -306,9 +306,9 @@ Summary instructions:
 1. Identify the main topics discussed
 2. Note any questions asked and answers given
 3. Highlight any decisions made or important information shared
-4. Keep the summary concise but informative
+4. Keep all responses brief and concise(4-5 sentences maximum)
 5. Format the summary in plain text (no markdown)
-Response language: Same as the user's message`, len(messages), combinedMessages)
+6. Response language: Same as the user's message`, len(messages), combinedMessages)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second) // Longer timeout for processing many messages
 	defer cancel()
