@@ -11,6 +11,7 @@ import (
 type Config struct {
 	BotToken     string
 	GeminiAPIKey string
+	MongoURI     string
 }
 
 const (
@@ -27,6 +28,7 @@ func LoadConfig() (*Config, error) {
 	}
 	fmt.Println("TELEGRAM_BOT_TOKEN:", os.Getenv("TELEGRAM_BOT_TOKEN"))
 	fmt.Println("GEMINI_API_KEY:", os.Getenv("GEMINI_API_KEY"))
+	fmt.Println("MONGO_URI:", os.Getenv("MONGO_URI"))
 
 	// Validate required vars exist in environment
 	botToken, err := getRequiredEnv("TELEGRAM_BOT_TOKEN")
@@ -39,9 +41,15 @@ func LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("configuration error: %w", err)
 	}
 
+	mongoURI, err := getRequiredEnv("MONGO_URI")
+	if err != nil {
+		return nil, fmt.Errorf("configuration error: %w", err)
+	}
+
 	return &Config{
 		BotToken:     botToken,
 		GeminiAPIKey: geminiKey,
+		MongoURI:     mongoURI,
 	}, nil
 }
 
