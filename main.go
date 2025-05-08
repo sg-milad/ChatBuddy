@@ -307,7 +307,8 @@ Summary instructions:
 2. Note any questions asked and answers given
 3. Highlight any decisions made or important information shared
 4. Keep the summary concise but informative
-5. Format the summary in plain text (no markdown)`, len(messages), combinedMessages)
+5. Format the summary in plain text (no markdown)
+Response language: Same as the user's message`, len(messages), combinedMessages)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second) // Longer timeout for processing many messages
 	defer cancel()
